@@ -108,25 +108,6 @@ def test_redirect_host_error_flags_hotlink_policy():
     assert "evil.example.com" in other["message"]
 
 
-def test_wrap_base64_lines_are_anchored_and_lossless():
-    import base64
-
-    from src.main import ASSET_BASE64_LINE_WIDTH, _wrap_base64
-
-    encoded = base64.b64encode(bytes(range(256)) * 20).decode("ascii")
-    wrapped = _wrap_base64(encoded)
-
-    lines = wrapped.split("\n")
-    assert all(len(line) == ASSET_BASE64_LINE_WIDTH for line in lines[:-1])
-    assert 0 < len(lines[-1]) <= ASSET_BASE64_LINE_WIDTH
-    # decoders ignore the newlines; joining restores the original exactly
-    assert wrapped.replace("\n", "") == encoded
-    assert base64.b64decode(wrapped) == base64.b64decode(encoded)
-
-    assert _wrap_base64("") == ""
-    assert _wrap_base64("abcd") == "abcd"
-
-
 def test_build_logo_urls_without_client_id_warns():
     from src.main import _client_id_var, build_logo_urls
 

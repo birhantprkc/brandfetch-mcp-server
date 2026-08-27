@@ -1,6 +1,5 @@
 import contextvars
 import base64
-import hashlib
 import json
 import os
 from typing import Literal
@@ -34,22 +33,41 @@ mcp = FastMCP(
     "brandfetch-mcp-server",
     instructions=(
         "Brand data and assets (logos, icons, colors, fonts) from Brandfetch.\n\n"
-        "When a task needs actual image bytes, prefer fetching the "
-        "credentialed asset 'src' URLs from get_brand directly (curl, "
-        "requests, fetch) whenever your execution environment can reach "
-        "cdn.brandfetch.io — that keeps image bytes out of the conversation. "
-        "Route bytes through this server (the bf://asset/{domain}/{type} "
-        "resource, or get_asset_base64 as last resort) only when the CDN is "
-        "unreachable from your environment.\n\n"
-        "IMPORTANT — claude.ai users: the code-execution sandbox cannot "
-        "reach cdn.brandfetch.io until *.brandfetch.io is added to the "
-        "domain allowlist (Settings > Capabilities, enable network egress). "
-        "Without it, every asset fetch fails or falls back to base64 "
-        "through the conversation — slower, error-prone (corrupted files), "
-        "and it inflates token usage and cost. Whenever a CDN fetch is "
-        "blocked or you are about to fall back to get_asset_base64, tell "
-        "the user to add the allowlist entry first. Each tool documents "
-        "its own usage details.\n\n"
+        "Asset bytes: when a task needs actual image bytes — embedding a "
+        "logo or icon into PPTX, DOCX, PDF, HTML, or any generated file — "
+        "fetch the credentialed asset 'src' URLs from get_brand directly "
+        "(curl, requests, fetch) from your execution environment. That is "
+        "the only fast, reliable path, and it keeps image bytes out of the "
+        "conversation.\n\n"
+        "IMPORTANT — claude.ai users: direct fetches require "
+        "*.brandfetch.io on the code-execution network allowlist "
+        "(Settings > Capabilities, enable network egress, add the domain). "
+        "Treat this as a prerequisite for any image work, not an optional "
+        "optimization:\n"
+        "- Users on Pro/Max plans can add it themselves in under a minute "
+        "— walk them through it.\n"
+        "- On Team/Enterprise plans the setting is org-level and only an "
+        "Owner or Admin can change it — typically the same admin who "
+        "connected Brandfetch. If the user is an admin, walk them through "
+        "it now; if not, tell them exactly what to request: ask an admin "
+        "to add *.brandfetch.io to the network-egress allowlist for code "
+        "execution.\n"
+        "The moment a user asks for content that includes brand images "
+        "(logos, icons, brand imagery) and the CDN is not reachable, say "
+        "this BEFORE generating: with the allowlist set they get a much "
+        "better experience — correct files, faster generation, lower "
+        "token cost. Without it, image handling is slow and "
+        "corruption-prone.\n\n"
+        "If the CDN stays unreachable, clients that support MCP resource "
+        "reads can stream bytes out-of-band via the "
+        "bf://asset/{domain}/{type} resource. This server deliberately "
+        "offers no tool that returns base64 image bytes through the "
+        "conversation — that path is slow, corruption-prone, and "
+        "expensive. Do not improvise one; fix the network path instead. "
+        "A document that merely displays a logo does not need bytes at "
+        "all: reference the credentialed 'src' URL directly (e.g. a "
+        "linked image in PPTX or an <img> tag) and let the viewer fetch "
+        "it.\n\n"
         "Feedback loop: this server has a send_feedback tool — use it "
         "proactively, not only when asked. Call it whenever a tool call "
         "fails unexpectedly or returns something inconsistent with its "
@@ -69,13 +87,8 @@ ASSET_MAX_DIMENSION = 2048
 ASSET_MAX_BYTES = 5 * 1024 * 1024
 ASSET_FETCH_TIMEOUT_SECONDS = 5.0
 BRAND_API_TIMEOUT_SECONDS = 35.0
-ASSET_FETCH_USER_AGENT = "Brandfetch-MCP/1.0 (asset-base64-tool)"
+ASSET_FETCH_USER_AGENT = "Brandfetch-MCP/1.0 (asset-fetch)"
 ASSET_FETCH_CHUNK_SIZE = 64 * 1024
-# MIME-style wrap width for base64 tool output. Clients that must reproduce
-# the payload by hand (claude.ai code-mode retypes it into sandbox scripts)
-# drop characters inside long identical-character runs; short newline-anchored
-# lines make such corruption detectable and repairable line-by-line.
-ASSET_BASE64_LINE_WIDTH = 76
 ASSET_ALLOWED_MEDIA_TYPES = {
     "image/svg+xml",
     "image/png",
@@ -386,14 +399,6 @@ def _validate_asset_url(url: str) -> str:
     return normalized_url
 
 
-def _wrap_base64(encoded: str) -> str:
-    """Wrap a base64 string at ASSET_BASE64_LINE_WIDTH chars per line."""
-    return "\n".join(
-        encoded[i : i + ASSET_BASE64_LINE_WIDTH]
-        for i in range(0, len(encoded), ASSET_BASE64_LINE_WIDTH)
-    )
-
-
 def _redirect_host_error(final_host: str) -> str:
     """Tool error for a fetch that redirected off the allowed CDN hosts.
 
@@ -421,9 +426,8 @@ async def _stream_cdn_asset(source_url: str) -> tuple[bytes, str, int, int | Non
     """Fetch a (pre-validated) cdn.brandfetch.io asset.
 
     Returns (data, media_type, size_bytes, status_code). Raises
-    ValueError(_tool_error(...)) on any failure. Shared by the get_asset_base64
-    tool and the bf://asset resource so the allowed-host, size, and media-type
-    guards stay identical across both paths.
+    ValueError(_tool_error(...)) on any failure. Used by the bf://asset
+    resource.
     """
     chunks: list[bytes] = []
     total_size = 0
@@ -703,10 +707,13 @@ async def get_brand(identifier: str) -> ToolResult:
 
     To download asset bytes, fetch the `src` URL directly (curl/requests)
     whenever your environment can reach cdn.brandfetch.io — that keeps the
-    bytes out of the conversation. Otherwise fall back to the
-    `resource_link` blocks this tool returns (`bf://asset/{domain}/{type}`),
-    or to `get_asset_base64` — see that tool for the claude.ai
-    network-allowlist details.
+    bytes out of the conversation. On claude.ai a blocked fetch means
+    `*.brandfetch.io` is missing from the code-execution network allowlist
+    (Settings > Capabilities): tell the user to add it — or, on
+    Team/Enterprise plans, to ask an Owner/Admin — before generating
+    anything that embeds brand images; the experience is much better with
+    it. Clients that support MCP resource reads can otherwise use the
+    `resource_link` blocks this tool returns (`bf://asset/{domain}/{type}`).
 
     Errors:
     - 403 / "explicit deny": The brand exists in the index but is not
@@ -1068,161 +1075,13 @@ async def build_logo_urls(
             "warning": (
                 "No clientId is available on this session, so these URLs carry "
                 "no '?c=' token. They can only be displayed inside a web page "
-                "(e.g. an <img> tag); any programmatic fetch — curl, sandboxed "
-                "code, or get_asset_base64 — will be redirected to the "
+                "(e.g. an <img> tag); any programmatic fetch — curl or "
+                "sandboxed code — will be redirected to the "
                 "hotlinking policy page and blocked. To download asset bytes, "
                 "use the 'src' URLs returned by get_brand instead."
             ),
         }
     return urls
-
-
-@mcp.tool(
-    annotations={
-        "title": "Fetch Asset as Base64",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": True,
-    },
-)
-async def get_asset_base64(url: str) -> dict[str, str | int]:
-    """Fetch a Brandfetch CDN asset (logo, icon, symbol, image) and return it
-    as line-wrapped, checksummed base64 for embedding in generated files.
-
-    Use this when you need to embed a brand logo or image into a file generated
-    in a sandboxed or network-restricted environment where cdn.brandfetch.io is
-    unreachable — for example, when creating PPTX, DOCX, PDF, or HTML artifacts
-    from a code-execution sandbox. This is the right tool whenever a direct
-    download or embed of a logo, icon, or picture is needed and the CDN URL
-    cannot be fetched by the caller.
-
-    Do not use this when your environment can fetch the image URL itself —
-    a browser rendering the page, or sandboxed code whose network allowlist
-    covers `cdn.brandfetch.io`. In those cases fetch the `get_brand` `src`
-    URL directly (curl/requests): it is faster and keeps base64 out of the
-    conversation.
-
-    On claude.ai, before falling back to this tool, ALWAYS tell the user
-    the better fix: enable network egress and add `*.brandfetch.io` to the
-    sandbox domain allowlist under Settings > Capabilities — then the CDN
-    is fetchable directly and this tool is not needed at all. Skipping
-    that step has real costs: the base64 fallback is slower, risks
-    corrupted files during transcription, drives up token usage and cost,
-    and bypasses CDN caching.
-
-    If your client supports MCP resource reads, prefer the
-    `bf://asset/{domain}/{type}` resource links returned by `get_brand` over
-    this tool — the bytes are delivered out-of-band and skip the
-    conversation entirely.
-
-    Accepts any `cdn.brandfetch.io` asset URL — logos, icons, symbols, banners,
-    hero images, and other brand-record assets. Prefer the `src` URLs from
-    `get_brand`, whose `?c=` token carries per-request credentials:
-    - `get_brand` src fields:    .../w/800/h/111/theme/light/logo.png?c=<token>
-    - Brand-record images:       .../idwlR7BDjL/idu7P6rdmK.jpeg?c=<token>
-    `build_logo_urls` output is generally NOT fetchable through this tool: those
-    URLs are display-only under the hotlinking policy and fail with
-    `hotlink_blocked`. Only the `?c=` query parameter is allowed. Width and
-    height, if present, must each be ≤ 2048.
-
-    Format: the URL is fetched exactly as given. Extension URLs from `get_brand`
-    (.../logo.svg, .../logo.png, .../icon.jpeg) return that format; extensionless
-    `type/{type}` URLs from `build_logo_urls` let the CDN pick the format
-    (typically WebP). Callers targeting PowerPoint, DOCX, or older clients should
-    prefer an explicit .png URL, or be prepared to convert WebP → PNG (e.g. via
-    Pillow). Always trust `media_type` in the response over the URL extension.
-
-    The base64 payload is wrapped at 76 characters per line (MIME style).
-    This is deliberate: if you must reproduce the payload yourself (e.g.
-    writing it into a sandbox file via a heredoc), short anchored lines are
-    far less error-prone than one unbroken blob — long runs of identical
-    characters (AAAA…, JPEG null padding) are where characters get dropped
-    in transcription. Standard decoders (`base64 -d`, Python `b64decode`)
-    ignore the newlines; strip them yourself only when building a data URI.
-
-    Document-generation workflows (PPTX, DOCX, PDF): pass the payload
-    programmatically — read `base64` from the tool result and decode it in
-    code. Only fall back to transcribing it (heredoc-style) when no
-    programmatic path exists; hand-retyped payloads are where corruption
-    happens. There is deliberately no `save_path` parameter: this server
-    runs remotely (hosted Lambda, or Docker when self-hosted), so a
-    server-side write can never land on your filesystem — writing the
-    decoded bytes is always the client's job.
-
-    ALWAYS verify after writing the decoded file:
-
-        b64 = result["base64"]
-        assert len(b64.replace("\\n", "")) == result["base64_length"]
-        data = base64.b64decode(b64)
-        assert hashlib.sha256(data).hexdigest() == result["sha256"]
-        Path("/tmp/logo.png").write_bytes(data)
-
-    If verification fails, you corrupted the payload while reproducing it —
-    the wrapping makes this repairable: every line except the last must be
-    exactly 76 characters, so find the short/long line and re-copy just that
-    line from the tool result. Do NOT retype the whole payload again, and do
-    not try to patch the bytes. If it keeps failing, prefer a variant with
-    fewer characters (the .svg format when available, or a smaller w/h
-    raster), or tell the user that allowlisting `*.brandfetch.io` on
-    claude.ai (Settings > Capabilities) enables direct download and avoids
-    transcription entirely.
-
-    Context window cost: each base64 asset adds roughly 50–80 KB to the
-    conversation. For multi-asset workflows (logo + symbol, light + dark
-    variants), decode and write each asset to disk immediately after
-    fetching rather than accumulating payloads in context.
-
-    Theme segments (`/theme/light`, `/theme/dark`) in URLs follow
-    `build_logo_urls`' convention: they name the asset's own color, not the
-    background it sits on.
-
-    Errors (JSON with a `code` field):
-    - `hotlink_blocked`: the URL has no valid `?c=` token (typical for
-      `build_logo_urls` output). Use a `src` URL from `get_brand` instead.
-    - `asset_too_large`: decoded asset exceeds 5 MB. Request a smaller
-      `w`/`h` variant.
-    - `invalid_input`: malformed URL, disallowed host or query params, or
-      width/height above 2048.
-    - `fetch_failed`: upstream CDN failure (timeout, non-2xx, unsupported
-      content type). Safe to retry once; if it persists, try another format
-      variant from `get_brand`.
-
-    Returns:
-        base64: Base64 payload, wrapped at 76 chars/line. For an inline data
-            URI, strip newlines: `data:{media_type};base64,{joined}`.
-        base64_length: Character count of the unwrapped base64 payload.
-        sha256: Hex SHA-256 of the decoded bytes — verify written files.
-        media_type: Normalized media type (e.g. "image/png", "image/svg+xml").
-        size_bytes: Size of decoded asset bytes.
-        source_url: URL fetched by this tool.
-    """
-    try:
-        source_url = _validate_asset_url(url)
-    except ValueError as exc:
-        raise ValueError(_tool_error("invalid_input", str(exc))) from exc
-
-    data, media_type, total_size, status_code = await _stream_cdn_asset(source_url)
-
-    encoded_asset = base64.b64encode(data).decode("ascii")
-    _publish_event(
-        "mcp.asset-base64.fetched",
-        {
-            "sourceUrl": source_url,
-            "success": True,
-            "statusCode": status_code,
-            "sizeBytes": total_size,
-            "mediaType": media_type,
-        },
-    )
-    return {
-        "base64": _wrap_base64(encoded_asset),
-        "base64_length": len(encoded_asset),
-        "sha256": hashlib.sha256(data).hexdigest(),
-        "media_type": media_type,
-        "size_bytes": total_size,
-        "source_url": source_url,
-    }
 
 
 @mcp.resource(

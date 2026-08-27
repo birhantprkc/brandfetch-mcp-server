@@ -16,7 +16,6 @@ Full documentation: **https://docs.brandfetch.com/mcp/overview**
 | `enrich_transaction` | Identify a merchant brand from a credit-card or bank-statement string.          |
 | `get_brand_context`  | Get LLM-ready brand context for a domain — voice, audience, positioning, style. |
 | `build_logo_urls`    | Construct Brandfetch Logo CDN URLs for one or more brands (no API call).        |
-| `get_asset_base64`   | Fetch a Brandfetch CDN asset (logo, icon, symbol, image) as base64.             |
 | `send_feedback`      | Report bugs, wrong or stale brand data, or missing capabilities to Brandfetch.  |
 
 ## Quick start (hosted server)
