@@ -3,7 +3,7 @@ import base64
 import json
 import os
 from typing import Literal
-from urllib.parse import parse_qsl, urlparse
+from urllib.parse import parse_qsl, unquote, urlparse
 
 from fastmcp import FastMCP
 from fastmcp.resources import ResourceContent, ResourceResult
@@ -13,19 +13,21 @@ from mcp.types import ResourceLink, TextContent
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response
+from starlette.responses import JSONResponse, PlainTextResponse, Response
 from starlette.routing import Route
 
 from .utils import events
 
-BRANDFETCH_API_BASE = os.environ.get(
-    "BRANDFETCH_API_BASE_URL", "https://api.brandfetch.io/v2"
-)
+BRANDFETCH_API_BASE = os.environ.get("BRANDFETCH_API_BASE_URL", "https://api.brandfetch.io/v2")
 MCP_BASE_URL = os.environ.get("MCP_BASE_URL", "https://mcp.brandfetch.io")
 OAUTH_PROTECTED_RESOURCE_PATH = "/.well-known/oauth-protected-resource"
 OAUTH_WELL_KNOWN_URL = f"{MCP_BASE_URL}{OAUTH_PROTECTED_RESOURCE_PATH}"
-OAUTH_SERVER_URL = os.environ.get(
-    "OAUTH_SERVER_URL", "https://developers.brandfetch.com"
+OAUTH_SERVER_URL = os.environ.get("OAUTH_SERVER_URL", "https://developers.brandfetch.com")
+# ChatGPT app-directory domain verification: OpenAI fetches this token as
+# plain text from the MCP hostname when the app submission is verified.
+OPENAI_APPS_CHALLENGE_PATH = "/.well-known/openai-apps-challenge"
+OPENAI_APPS_CHALLENGE_TOKEN = os.environ.get(
+    "OPENAI_APPS_CHALLENGE_TOKEN", "-qsACEI40uzqlyRXQfW41QCa_V06Xg52aRdsdbmK9fA"
 )
 
 
@@ -150,9 +152,7 @@ class CredentialsMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         auth_header = request.headers.get("Authorization", "")
         if auth_header.lower().startswith("bearer "):
-            api_key, token_client_id, org_urn = _decode_bearer_token(
-                auth_header[7:].strip()
-            )
+            api_key, token_client_id, org_urn = _decode_bearer_token(auth_header[7:].strip())
         else:
             api_key, token_client_id, org_urn = (
                 request.query_params.get("apiKey", ""),
@@ -173,8 +173,7 @@ class CredentialsMiddleware(BaseHTTPMiddleware):
                 status_code=401,
                 headers={
                     "WWW-Authenticate": (
-                        f'Bearer realm="{MCP_BASE_URL}", '
-                        f'resource_metadata="{OAUTH_WELL_KNOWN_URL}"'
+                        f'Bearer realm="{MCP_BASE_URL}", resource_metadata="{OAUTH_WELL_KNOWN_URL}"'
                     )
                 },
             )
@@ -195,13 +194,8 @@ class NonEmptyBodyMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next):
         response = await call_next(request)
-        if (
-            response.status_code == 202
-            and response.headers.get("content-length") == "0"
-        ):
-            headers = {
-                k: v for k, v in response.headers.items() if k != "content-length"
-            }
+        if response.status_code == 202 and response.headers.get("content-length") == "0":
+            headers = {k: v for k, v in response.headers.items() if k != "content-length"}
             return Response(
                 content=b"{}",
                 status_code=202,
@@ -288,6 +282,18 @@ def _quota_exhausted_message(body: str) -> str:
         f"Check or upgrade your plan at {DASHBOARD_URL} . "
         "brand_search and build_logo_urls do not consume credits and keep working."
     )
+
+
+def _domain_only(identifier: str) -> str:
+    """The spelling of an identifier the event bus may carry.
+
+    An email address is reduced to its domain — the bus has no reason to carry a
+    third party's mailbox. The REST API reads the percent-encoded
+    spelling (`%40`) as the same address, so it is reduced the same way.
+    Everything else passes through unchanged.
+    """
+    candidate = unquote(identifier) if "%40" in identifier.lower() else identifier
+    return candidate.rsplit("@", 1)[-1]
 
 
 def _error_message(status: int, body: str, context: str) -> str:
@@ -380,9 +386,7 @@ def _validate_asset_url(url: str) -> str:
             if dimension <= 0:
                 raise ValueError(f"{dim_name} must be greater than 0")
             if dimension > ASSET_MAX_DIMENSION:
-                raise ValueError(
-                    f"{dim_name} {dimension} exceeds maximum {ASSET_MAX_DIMENSION}"
-                )
+                raise ValueError(f"{dim_name} {dimension} exceeds maximum {ASSET_MAX_DIMENSION}")
             i += 2
         else:
             i += 1
@@ -465,10 +469,7 @@ async def _stream_cdn_asset(source_url: str) -> tuple[bytes, str, int, int | Non
                         content_length_bytes = int(content_length)
                     except ValueError:
                         content_length_bytes = None
-                    if (
-                        content_length_bytes is not None
-                        and content_length_bytes > ASSET_MAX_BYTES
-                    ):
+                    if content_length_bytes is not None and content_length_bytes > ASSET_MAX_BYTES:
                         raise ValueError(
                             _tool_error(
                                 "asset_too_large",
@@ -485,9 +486,7 @@ async def _stream_cdn_asset(source_url: str) -> tuple[bytes, str, int, int | Non
                         )
                     )
 
-                async for chunk in response.aiter_bytes(
-                    chunk_size=ASSET_FETCH_CHUNK_SIZE
-                ):
+                async for chunk in response.aiter_bytes(chunk_size=ASSET_FETCH_CHUNK_SIZE):
                     total_size += len(chunk)
                     if total_size > ASSET_MAX_BYTES:
                         raise ValueError(
@@ -507,9 +506,7 @@ async def _stream_cdn_asset(source_url: str) -> tuple[bytes, str, int, int | Non
             )
         ) from exc
     except httpx.HTTPError as exc:
-        raise ValueError(
-            _tool_error("fetch_failed", f"upstream fetch failed: {exc}")
-        ) from exc
+        raise ValueError(_tool_error("fetch_failed", f"upstream fetch failed: {exc}")) from exc
 
     return b"".join(chunks), media_type, total_size, status_code
 
@@ -631,9 +628,7 @@ async def brand_search(query: str) -> str:
     if client_id:
         params["c"] = client_id
     async with httpx.AsyncClient(timeout=BRAND_API_TIMEOUT_SECONDS) as client:
-        resp = await client.get(
-            f"{BRANDFETCH_API_BASE}/search/{query.strip()}", params=params
-        )
+        resp = await client.get(f"{BRANDFETCH_API_BASE}/search/{query.strip()}", params=params)
     _publish_event(
         "mcp.brand.searched",
         {"query": query, "success": resp.is_success, "statusCode": resp.status_code},
@@ -659,7 +654,7 @@ async def brand_search(query: str) -> str:
     },
 )
 async def get_brand(identifier: str) -> ToolResult:
-    """Look up full brand data by domain, stock ticker, ISIN, or crypto symbol.
+    """Look up full brand data by domain, email address, stock ticker, ISIN, or crypto symbol.
 
     Call this directly when you have a confident identifier — either from a
     prior `brand_search` result, or from your own knowledge for well-known
@@ -669,7 +664,11 @@ async def get_brand(identifier: str) -> ToolResult:
 
     The identifier is auto-resolved in this order: domain → ticker → ISIN →
     crypto. Examples (all Nike): "nike.com", "NKE", "US6541061031". For
-    crypto: "BTC", "ETH".
+    crypto: "BTC", "ETH". An identifier that contains "@" is read as an email
+    address and resolved to the brand behind its domain ("john@nike.com" →
+    Nike, "joe@gmail.com" → gmail.com). Mailbox-provider domains resolve like
+    any other domain. You judge whether the domain is the contact's company —
+    the API does not.
 
     For clean brand name lookups, prefer brand_search followed by get_brand —
     those are more reliable for unambiguous queries.
@@ -729,8 +728,8 @@ async def get_brand(identifier: str) -> ToolResult:
     "data-quality"), including the brand's domain.
 
     Args:
-        identifier: A domain ("nike.com"), ticker ("NKE"), ISIN
-            ("US6541061031"), or crypto symbol ("BTC").
+        identifier: A domain ("nike.com"), email address ("john@nike.com"),
+            ticker ("NKE"), ISIN ("US6541061031"), or crypto symbol ("BTC").
     """
     api_key = _get_api_key()
     async with httpx.AsyncClient(timeout=BRAND_API_TIMEOUT_SECONDS) as client:
@@ -741,7 +740,7 @@ async def get_brand(identifier: str) -> ToolResult:
     _publish_event(
         "mcp.brand.fetched",
         {
-            "identifier": identifier,
+            "identifier": _domain_only(identifier),
             "success": resp.is_success,
             "statusCode": resp.status_code,
         },
@@ -917,8 +916,11 @@ async def get_brand_context(domain: str) -> str:
 
     Args:
         domain: The brand's exact domain, lowercase, no scheme or path
-            (e.g. "microsoft.com", "digitec.ch", "fleurdepains.ch"). If you
-            only have a brand name, call `brand_search` first.
+            (e.g. "microsoft.com", "digitec.ch", "fleurdepains.ch"), or an
+            email address on the brand's domain ("john@microsoft.com") — the
+            API resolves it to the registrable domain, a mailbox provider's
+            as much as a company's. If you only have a brand name, call
+            `brand_search` first.
     """
     api_key = _get_api_key()
     async with httpx.AsyncClient(timeout=BRAND_API_TIMEOUT_SECONDS) as client:
@@ -929,7 +931,7 @@ async def get_brand_context(domain: str) -> str:
     _publish_event(
         "mcp.brand-context.fetched",
         {
-            "domain": domain,
+            "domain": _domain_only(domain),
             "success": resp.is_success,
             "statusCode": resp.status_code,
         },
@@ -1114,9 +1116,7 @@ async def asset_resource(domain: str, type: str) -> ResourceResult:
     brand = await _get_brand_json(domain)
     src = _resolve_asset_src(brand, type)
     if not src:
-        raise ValueError(
-            _tool_error("not_found", f"no {type} asset available for '{domain}'")
-        )
+        raise ValueError(_tool_error("not_found", f"no {type} asset available for '{domain}'"))
 
     source_url = _validate_asset_url(src)
     data, media_type, total_size, status_code = await _stream_cdn_asset(source_url)
@@ -1238,15 +1238,12 @@ async def send_feedback(
             ],
         }
         try:
-            async with httpx.AsyncClient(
-                timeout=FEEDBACK_SLACK_TIMEOUT_SECONDS
-            ) as client:
+            async with httpx.AsyncClient(timeout=FEEDBACK_SLACK_TIMEOUT_SECONDS) as client:
                 resp = await client.post(webhook_url, json=payload)
             delivered = resp.is_success
             if not delivered:
                 print(
-                    f"[mcp-server] Slack feedback webhook returned "
-                    f"{resp.status_code}: {resp.text}"
+                    f"[mcp-server] Slack feedback webhook returned {resp.status_code}: {resp.text}"
                 )
         except httpx.HTTPError as exc:
             print(f"[mcp-server] Slack feedback webhook failed: {exc}")
@@ -1271,8 +1268,7 @@ async def send_feedback(
         raise ValueError(
             _tool_error(
                 "delivery_failed",
-                "Feedback could not be delivered. Do not retry; "
-                "let the user know it failed.",
+                "Feedback could not be delivered. Do not retry; let the user know it failed.",
             )
         )
 
@@ -1286,6 +1282,10 @@ async def send_feedback(
 
 async def health(request: Request):
     return JSONResponse({"status": "ok"})
+
+
+async def openai_apps_challenge(request: Request):
+    return PlainTextResponse(OPENAI_APPS_CHALLENGE_TOKEN)
 
 
 async def oauth_protected_resource(request: Request):
@@ -1319,10 +1319,9 @@ app = mcp.http_app(
 app.add_middleware(CredentialsMiddleware)
 app.add_middleware(NonEmptyBodyMiddleware)
 app.routes.append(Route("/health", health))
+app.routes.append(Route(OPENAI_APPS_CHALLENGE_PATH, openai_apps_challenge))
 app.routes.append(Route(OAUTH_PROTECTED_RESOURCE_PATH, oauth_protected_resource))
-app.routes.append(
-    Route(f"{OAUTH_PROTECTED_RESOURCE_PATH}/mcp", oauth_protected_resource_mcp)
-)
+app.routes.append(Route(f"{OAUTH_PROTECTED_RESOURCE_PATH}/mcp", oauth_protected_resource_mcp))
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

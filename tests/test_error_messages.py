@@ -8,9 +8,7 @@ import pytest
 from src.main import DASHBOARD_URL, _error_message
 
 
-QUOTA_BODY = json.dumps(
-    {"message": "API key quota exceeded", "quota": 250, "used": 251}
-)
+QUOTA_BODY = json.dumps({"message": "API key quota exceeded", "quota": 250, "used": 251})
 
 
 def test_429_includes_usage_numbers_when_the_body_carries_them():

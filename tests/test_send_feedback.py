@@ -141,7 +141,4 @@ def test_send_feedback_escapes_slack_control_characters(slack, published):
     _send(message="tags like <script> & <b> broke")
 
     _url, payload = slack.posts[0]
-    assert (
-        payload["blocks"][2]["text"]["text"]
-        == "tags like &lt;script&gt; &amp; &lt;b&gt; broke"
-    )
+    assert payload["blocks"][2]["text"]["text"] == "tags like &lt;script&gt; &amp; &lt;b&gt; broke"

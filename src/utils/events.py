@@ -9,9 +9,7 @@ SOURCE = "mcp-server"
 
 _sns = boto3.client(
     "sns",
-    region_name=os.environ.get("AWS_REGION")
-    or os.environ.get("AWS_DEFAULT_REGION")
-    or "us-east-1",
+    region_name=os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "us-east-1",
 )
 
 

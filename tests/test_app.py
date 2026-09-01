@@ -118,9 +118,7 @@ def test_build_logo_urls_without_client_id_warns():
         _client_id_var.reset(token)
 
     assert set(result) == {"urls", "warning"}
-    assert result["urls"] == [
-        "https://cdn.brandfetch.io/nike.com/theme/dark/fallback/404"
-    ]
+    assert result["urls"] == ["https://cdn.brandfetch.io/nike.com/theme/dark/fallback/404"]
     assert "?c=" not in result["urls"][0]
     assert "hotlinking" in result["warning"]
 
@@ -130,12 +128,26 @@ def test_build_logo_urls_with_client_id_returns_plain_list():
 
     token = _client_id_var.set("myClientId")
     try:
-        result = asyncio.run(
-            build_logo_urls(identifiers=["nike.com"], type="logo", width=400)
-        )
+        result = asyncio.run(build_logo_urls(identifiers=["nike.com"], type="logo", width=400))
     finally:
         _client_id_var.reset(token)
 
     assert result == [
         "https://cdn.brandfetch.io/nike.com/w/400/theme/dark/fallback/404/type/logo?c=myClientId"
     ]
+
+
+def test_openai_apps_challenge_served_as_plain_text():
+    """ChatGPT domain verification fetches the token unauthenticated as text/plain."""
+    from src.main import (
+        OPENAI_APPS_CHALLENGE_PATH,
+        OPENAI_APPS_CHALLENGE_TOKEN,
+        app,
+        openai_apps_challenge,
+    )
+
+    assert any(getattr(r, "path", None) == OPENAI_APPS_CHALLENGE_PATH for r in app.routes)
+
+    response = asyncio.run(openai_apps_challenge(None))
+    assert response.media_type == "text/plain"
+    assert response.body.decode() == OPENAI_APPS_CHALLENGE_TOKEN
