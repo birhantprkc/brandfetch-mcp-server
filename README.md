@@ -5,7 +5,8 @@ The official [Model Context Protocol](https://modelcontextprotocol.io) server fo
 search, company data, logos and design assets, and LLM-ready brand context from
 the Brandfetch API.
 
-Full documentation: **https://docs.brandfetch.com/mcp/overview**
+- Learn more: **https://brandfetch.com/developers/mcp**
+- Full documentation: **https://docs.brandfetch.com/mcp/overview**
 
 ## Tools
 
