@@ -19,6 +19,15 @@ the Brandfetch API.
 | `build_logo_urls`    | Construct Brandfetch Logo CDN URLs for one or more brands (no API call).        |
 | `send_feedback`      | Report bugs, wrong or stale brand data, or missing capabilities to Brandfetch.  |
 
+## Interactive brand card (MCP Apps)
+
+On hosts that support the [MCP Apps extension](https://modelcontextprotocol.io/docs/extensions/apps)
+(claude.ai, Claude Desktop, ...), `get_brand` results render as an interactive
+brand card: logo preview, format switcher (SVG/PNG/WebP/...), download and
+copy-URL actions. Hosts without Apps support fall back to the regular JSON tool
+result. The widget source lives in [`ui/`](./ui/) and is served by the server as
+the `ui://brandfetch/brand-card.html` resource.
+
 ## Quick start (hosted server)
 
 The easiest way to use this server is to connect to the Brandfetch-hosted

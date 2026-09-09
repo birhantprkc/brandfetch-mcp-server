@@ -19,7 +19,30 @@ def test_error_message_nudges_on_data_gaps_and_upstream_failures():
 
 @pytest.mark.parametrize("status", [401, 403, 429])
 def test_error_message_skips_nudge_on_caller_side_errors(status):
-    assert "send_feedback" not in _error_message(status, "", "")
+    assert main.FEEDBACK_NUDGE not in _error_message(status, "", "")
+
+
+@pytest.mark.parametrize("status", [403, 429])
+def test_credit_errors_are_named_account_state_not_defects(status):
+    """PRD-5181: clients filed 403/429 credit errors as bugs — the message must
+    say whose problem it is and steer away from send_feedback."""
+    message = _error_message(status, '{"quota": 100, "used": 106}', "")
+    assert "do not report it with send_feedback" in message
+    assert main.DASHBOARD_URL in message
+    assert "brand_search and build_logo_urls do not consume credits" in message
+    if status == 429:
+        assert "used 106 of 100 credits" in message
+        # The overshoot is expected under concurrency; say so before a client
+        # reports the counter as a bug.
+        assert "past the quota" in message
+
+
+def test_credit_tools_docstrings_disclaim_account_state():
+    tools = {t.name: t for t in asyncio.run(main.mcp.list_tools())}
+    for name in ("get_brand", "get_brand_context", "enrich_transaction"):
+        description = tools[name].description or ""
+        assert "never report it with send_feedback" in description, name
+    assert "Do not report credit or quota errors" in (main.mcp.instructions or "")
 
 
 def test_tool_error_hints_on_eligible_codes():

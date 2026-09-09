@@ -2,10 +2,15 @@ import contextvars
 import base64
 import json
 import os
-from typing import Literal
+import re
+from pathlib import Path
+from typing import Annotated, Literal
+
+from pydantic import Field
 from urllib.parse import parse_qsl, unquote, urlparse
 
 from fastmcp import FastMCP
+from fastmcp.apps import AppConfig, ResourceCSP, ResourcePermissions
 from fastmcp.resources import ResourceContent, ResourceResult
 from fastmcp.tools.tool import ToolResult
 import httpx
@@ -29,12 +34,28 @@ OPENAI_APPS_CHALLENGE_PATH = "/.well-known/openai-apps-challenge"
 OPENAI_APPS_CHALLENGE_TOKEN = os.environ.get(
     "OPENAI_APPS_CHALLENGE_TOKEN", "-qsACEI40uzqlyRXQfW41QCa_V06Xg52aRdsdbmK9fA"
 )
+# OAuth discovery makes clients (claude.ai) prefer the OAuth flow over
+# ?apiKey= query credentials. Disable for local/tunnel testing where the
+# authorization server can't complete dynamic client registration.
+OAUTH_DISCOVERY_ENABLED = os.environ.get("MCP_OAUTH_DISCOVERY", "true").lower() not in {
+    "0",
+    "false",
+    "no",
+}
 
 
 mcp = FastMCP(
     "brandfetch-mcp-server",
     instructions=(
         "Brand data and assets (logos, icons, colors, fonts) from Brandfetch.\n\n"
+        "Visual intent \u2192 interactive card: on MCP Apps hosts (claude.ai, "
+        "Claude Desktop), get_brand renders an interactive brand card "
+        "(logos, colors, fonts, images, company profile, brand voice) in "
+        "the conversation. Whenever the user wants to SEE a brand (logo, "
+        "colors), explore its profile, compare variants, or get a URL or "
+        "download link they can use directly, call get_brand and let the "
+        "card do the presenting \u2014 it beats describing assets in text or "
+        "pasting raw URLs.\n\n"
         "Asset bytes: when a task needs actual image bytes — embedding a "
         "logo or icon into PPTX, DOCX, PDF, HTML, or any generated file — "
         "fetch the credentialed asset 'src' URLs from get_brand directly "
@@ -76,7 +97,10 @@ mcp = FastMCP(
         "docs, brand data looks wrong, stale, or missing, a capability you "
         "needed doesn't exist, or the user expresses frustration or praise "
         "about Brandfetch. A short specific report (tool, arguments, "
-        "expected vs. actual) is enough."
+        "expected vs. actual) is enough. Do not report credit or quota "
+        "errors (401/403/429): they describe the user's account, not a "
+        "fault, and the message already tells you what to relay to the "
+        "user."
     ),
 )
 
@@ -91,6 +115,13 @@ ASSET_FETCH_TIMEOUT_SECONDS = 5.0
 BRAND_API_TIMEOUT_SECONDS = 35.0
 ASSET_FETCH_USER_AGENT = "Brandfetch-MCP/1.0 (asset-fetch)"
 ASSET_FETCH_CHUNK_SIZE = 64 * 1024
+
+# MCP Apps (SEP-1865): interactive brand card rendered by hosts that support
+# the io.modelcontextprotocol/ui extension (claude.ai, Claude Desktop, ...).
+# The artifact is built from ui/ (vite single-file) and committed under src/
+# so it ships with the existing Dockerfile COPY and public-repo mirror.
+BRAND_CARD_URI = "ui://brandfetch/brand-card.html"
+_BRAND_CARD_PATH = Path(__file__).parent / "ui" / "brand-card.html"
 ASSET_ALLOWED_MEDIA_TYPES = {
     "image/svg+xml",
     "image/png",
@@ -168,14 +199,19 @@ class CredentialsMiddleware(BaseHTTPMiddleware):
         # If no credentials are present at all (a clientId alone is enough for
         # the keyless tools) start the OAuth flow using the well known.
         if not api_key and not client_id and request.url.path.rstrip("/") == "/mcp":
-            return JSONResponse(
-                {"error": "unauthorized", "message": MISSING_CREDENTIALS_MESSAGE},
-                status_code=401,
-                headers={
+            challenge = (
+                {
                     "WWW-Authenticate": (
                         f'Bearer realm="{MCP_BASE_URL}", resource_metadata="{OAUTH_WELL_KNOWN_URL}"'
                     )
-                },
+                }
+                if OAUTH_DISCOVERY_ENABLED
+                else None
+            )
+            return JSONResponse(
+                {"error": "unauthorized", "message": MISSING_CREDENTIALS_MESSAGE},
+                status_code=401,
+                headers=challenge,
             )
 
         return await call_next(request)
@@ -203,6 +239,31 @@ class NonEmptyBodyMiddleware(BaseHTTPMiddleware):
                 media_type="application/json",
             )
         return response
+
+
+class RpcMethodLogMiddleware(BaseHTTPMiddleware):
+    """Log the JSON-RPC method of each /mcp POST (dev-only, MCP_DEBUG_RPC=1).
+
+    Lets local runs see what a connected client actually requests
+    (tools/list, resources/read of ui:// resources, ...) without parsing
+    SSE response bodies.
+    """
+
+    async def dispatch(self, request: Request, call_next):
+        if request.method == "POST" and request.url.path.rstrip("/") == "/mcp":
+            try:
+                payload = json.loads(await request.body())
+                detail = ""
+                if payload.get("method") == "resources/read":
+                    detail = f" uri={payload.get('params', {}).get('uri')}"
+                elif payload.get("method") == "tools/call":
+                    detail = f" name={payload.get('params', {}).get('name')}"
+                elif payload.get("method") == "initialize":
+                    detail = f" client={payload.get('params', {}).get('clientInfo')} capabilities={payload.get('params', {}).get('capabilities')}"
+                print(f"[rpc] {payload.get('method')}{detail}", flush=True)
+            except Exception:
+                print("[rpc] <unparseable body>", flush=True)
+        return await call_next(request)
 
 
 SIGNUP_URL = "https://developers.brandfetch.com/register"
@@ -265,6 +326,16 @@ _NUDGE_EXCLUDED_STATUSES = {401, 403, 429}
 _NUDGE_ELIGIBLE_CODES = {"fetch_failed", "not_found"}
 
 
+# Closing line of every credit / quota error. The plan state is the user's to
+# change; the model's job is to relay it, not to file it as a defect.
+ACCOUNT_STATE_NOTE = (
+    "This is the account's plan state, not a fault in the brand data or the "
+    "server, so do not report it with send_feedback. Tell the user to check "
+    f"their plan and credits at {DASHBOARD_URL} . brand_search and "
+    "build_logo_urls do not consume credits and keep working."
+)
+
+
 def _quota_exhausted_message(body: str) -> str:
     # The API's 429 body currently carries {"quota": N, "used": M}; treat those
     # numbers as a bonus, never a requirement — the shape may evolve.
@@ -278,9 +349,10 @@ def _quota_exhausted_message(body: str) -> str:
         if isinstance(quota, int) and isinstance(used, int):
             usage = f" (used {used} of {quota} credits)"
     return (
-        f"API quota exhausted{usage}: this API key has no API credits left. "
-        f"Check or upgrade your plan at {DASHBOARD_URL} . "
-        "brand_search and build_logo_urls do not consume credits and keep working."
+        f"API quota exhausted{usage}: this API key's API credits for the "
+        "current billing period are used up. Concurrent calls can carry the "
+        "counter slightly past the quota before requests are refused; that is "
+        f"expected. Do not retry. {ACCOUNT_STATE_NOTE}"
     )
 
 
@@ -305,9 +377,10 @@ def _error_message(status: int, body: str, context: str) -> str:
             # The API answers 403 both for keys without access and for plans
             # with zero API credits — don't blame the key alone.
             403: (
-                "Forbidden: this API key has no available API credits or does "
-                "not have access to this resource. The key itself may be valid "
-                f"— check your plan and key status at {DASHBOARD_URL} ."
+                "Forbidden: the plan behind this API key includes no API "
+                "credits, or the key does not have access to this resource. "
+                "The key itself may be valid; the brand record is fine. Do not "
+                f"retry. {ACCOUNT_STATE_NOTE}"
             ),
             404: context,
         }
@@ -620,6 +693,10 @@ async def brand_search(query: str) -> str:
     Results are already sorted by relevance; the first result is usually the
     best match for well-known brands.
 
+    When the user's goal is to see the brand or grab its assets, follow up
+    with get_brand on the chosen domain — on MCP Apps hosts it renders an
+    interactive card with logo preview, download, and copy-URL actions.
+
     Args:
         query: Brand name query string (e.g. "Madame Kim", "Nike").
     """
@@ -652,9 +729,45 @@ async def brand_search(query: str) -> str:
         "idempotentHint": True,
         "openWorldHint": True,
     },
+    app=AppConfig(resource_uri=BRAND_CARD_URI),
 )
-async def get_brand(identifier: str) -> ToolResult:
+async def get_brand(
+    identifier: str,
+    view: Annotated[
+        Literal["about", "logos", "colors", "fonts", "images", "brand_voice"] | None,
+        Field(
+            description=(
+                "The aspect of the brand the user asked about — ALWAYS set "
+                "this when they name one, so the interactive card opens on "
+                "the right tab: colors ('their colors', 'brand palette') → "
+                "'colors'; fonts/typography → 'fonts'; logo/icon → 'logos'; "
+                "banners/imagery → 'images'; company info/description → "
+                "'about'; brand voice/tone/personality → 'brand_voice'. "
+                "Omit only for general brand lookups. Never changes the "
+                "returned data."
+            ),
+        ),
+    ] = None,
+) -> ToolResult:
     """Look up full brand data by domain, email address, stock ticker, ISIN, or crypto symbol.
+
+    On MCP Apps hosts (claude.ai, Claude Desktop) this tool also renders an
+    interactive brand profile card in the conversation: live logo preview
+    with variant/format switchers and one-click Download / Copy URL, plus
+    tabs for brand colors, fonts, images, company firmographics, and
+    on-demand brand context (voice, positioning, products). Prefer it over
+    text answers or build_logo_urls whenever the user's intent is visual or
+    asset-oriented:
+    - see or visualize a brand ("show me Nike's logo", "what does their
+      branding look like"),
+    - download a logo file, or get a URL / embed link they can use directly,
+    - compare variants (logo vs symbol vs icon, light vs dark) or formats
+      (SVG, PNG, WebP) and pick one.
+    When the user names a specific aspect (colors, fonts, brand voice,
+    imagery, company info), also set `view` so the card opens on that tab.
+    Once the card is rendered, don't re-list asset URLs in text — the card's
+    Download and Copy URL buttons already hand the user the exact file and a
+    ready-to-use URL.
 
     Call this directly when you have a confident identifier — either from a
     prior `brand_search` result, or from your own knowledge for well-known
@@ -672,6 +785,12 @@ async def get_brand(identifier: str) -> ToolResult:
 
     For clean brand name lookups, prefer brand_search followed by get_brand —
     those are more reliable for unambiguous queries.
+
+    Set `view` to the aspect of the brand the user asked about, and the
+    interactive card opens on that tab: "okta brand voice" → "brand_voice",
+    "brandfetch colors" → "colors", "their fonts" → "fonts". Omit it for
+    general lookups. It never changes the returned data, and hosts without
+    the card simply ignore it.
 
     Returns a brand object containing:
     - `name`, `domain`, `description`: Core identity.
@@ -715,13 +834,15 @@ async def get_brand(identifier: str) -> ToolResult:
     `resource_link` blocks this tool returns (`bf://asset/{domain}/{type}`).
 
     Errors:
-    - 403 / "explicit deny": The brand exists in the index but is not
-      accessible on the current API tier or has access restrictions. Do not
+    - 403 / "explicit deny": The brand exists in the index but the plan
+      behind the API key has no API credits, or the key lacks access. Do not
       retry — fall back to displaying the `icon` URL from `brand_search`
-      (display-only, not downloadable) or inform the user.
+      (display-only, not downloadable) and tell the user to check their
+      plan. Account state, not a bug: never report it with send_feedback.
     - 404: Identifier not found. Try `brand_search` with a name query instead.
-    - 429: API quota exhausted. Do not retry — `brand_search` and
-      `build_logo_urls` do not consume quota and keep working.
+    - 429: API quota exhausted for the billing period. Do not retry —
+      `brand_search` and `build_logo_urls` do not consume quota and keep
+      working. Account state, not a bug: never report it with send_feedback.
 
     If the returned data is visibly wrong or stale (wrong logo, outdated
     colors, missing company info), report it with send_feedback (category
@@ -794,8 +915,12 @@ async def enrich_transaction(transaction_label: str, country_code: str) -> str:
     - transaction_label: "SQ *BLUE BOTTLE", country_code: "US"
 
     Errors:
-    - 429: API quota exhausted. Do not retry — `brand_search` and
-      `build_logo_urls` do not consume quota and keep working.
+    - 403: The plan behind the API key has no API credits, or the key lacks
+      access. Do not retry; tell the user to check their plan. Account state,
+      not a bug: never report it with send_feedback.
+    - 429: API quota exhausted for the billing period. Do not retry —
+      `brand_search` and `build_logo_urls` do not consume quota and keep
+      working. Account state, not a bug: never report it with send_feedback.
 
     Args:
         transaction_label: The raw text from a credit card or bank statement
@@ -909,10 +1034,12 @@ async def get_brand_context(domain: str) -> str:
       tell the user that subjective brand context is currently unavailable.
     - 404: No context available for this domain. Try `brand_search` to find
       a canonical domain, then retry.
-    - 403: Authentication, access tier, or exhausted-credits issue. Do not
-      retry; surface to the user.
-    - 429: API quota exhausted. Do not retry — `brand_search` and
-      `build_logo_urls` do not consume quota and keep working.
+    - 403: Authentication, access tier, or no-credits plan. Do not retry;
+      tell the user to check their plan. Account state, not a bug: never
+      report it with send_feedback.
+    - 429: API quota exhausted for the billing period. Do not retry —
+      `brand_search` and `build_logo_urls` do not consume quota and keep
+      working. Account state, not a bug: never report it with send_feedback.
 
     Args:
         domain: The brand's exact domain, lowercase, no scheme or path
@@ -988,6 +1115,11 @@ async def build_logo_urls(
     - Provide a displayable image URL to the user
     - Understand the URL grammar to tune dimensions, theme, or asset type
       for logos already obtained via `get_brand`
+
+    When the user wants to preview, compare, or download a brand's assets
+    themselves, prefer `get_brand` — on MCP Apps hosts it renders an
+    interactive card (preview, download, copy-URL), and its URLs carry
+    per-request credentials that allow programmatic fetching.
 
     Accepts multiple identifiers in a single call to avoid repeated round
     trips. All identifiers share the same display options (type, theme,
@@ -1140,6 +1272,27 @@ def _slack_escape(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+# A credit / quota report names the resource (credits or quota) AND a failure
+# (exhausted, no ... credits, 403/429, ...). Both are required: a data-quality
+# report about a "credit card" brand or a CDN 403 on its own is not account
+# state, and neither is a feature request that merely mentions credits ("expose
+# the credits available in the response") — only failure phrasing counts. The
+# vocabulary includes the server's own error strings, since clients quote them
+# back verbatim.
+_ACCOUNT_STATE_RESOURCE_RE = re.compile(r"\b(api[ -])?(credits?|quota)\b", re.IGNORECASE)
+_ACCOUNT_STATE_FAILURE_RE = re.compile(
+    r"exhaust|\bno (?:[\w-]+ ){0,3}credits\b|used \d+ of \d+|out of credits|ran out"
+    r"|forbidden|\b(401|403|429)\b|exceed|(over|past) the (limit|quota)",
+    re.IGNORECASE,
+)
+
+
+def _is_account_state_feedback(text: str) -> bool:
+    return bool(_ACCOUNT_STATE_RESOURCE_RE.search(text)) and bool(
+        _ACCOUNT_STATE_FAILURE_RE.search(text)
+    )
+
+
 @mcp.tool(
     annotations={
         "title": "Send Feedback",
@@ -1175,12 +1328,22 @@ async def send_feedback(
     vague. Send one call per distinct issue rather than bundling several
     topics into one message.
 
+    Do NOT use this tool for credit, quota, or plan errors — a 401, a 403
+    "no API credits", or a 429 "quota exhausted". Those describe the user's
+    account, not a defect: the Brandfetch team cannot act on them and such
+    reports are filtered out before anyone reads them. Tell the user to
+    check their plan and credits at https://developers.brandfetch.com
+    instead. If a credit error surfaced alongside a genuine data or tool
+    problem, report only the latter.
+
     This is a one-way channel to the Brandfetch team — nobody replies through
     it. For account or billing help, direct the user to
     https://developers.brandfetch.com instead. Never include API keys, bearer
     tokens, or personal data in the message.
 
-    Returns a JSON acknowledgment: {"status": "received", ...}.
+    Returns a JSON acknowledgment: {"status": "received", ...}, or
+    {"status": "declined", "reason": "account_state", ...} for credit / quota
+    reports.
 
     Args:
         message: The feedback text. Plain text or simple markdown; messages
@@ -1199,6 +1362,36 @@ async def send_feedback(
         text = text[:FEEDBACK_MAX_CHARS] + "… [truncated]"
 
     tool = (tool_name or "").strip()
+
+    if _is_account_state_feedback(text):
+        # Kept out of Slack — the event trail still records that a client
+        # tried, so the description can be tuned if this keeps happening.
+        _publish_event(
+            "mcp.feedback.submitted",
+            {
+                "category": category,
+                **({"toolName": tool} if tool else {}),
+                "message": text,
+                "delivered": False,
+                "truncated": truncated,
+                "declined": "account_state",
+            },
+        )
+        return json.dumps(
+            {
+                "status": "declined",
+                "reason": "account_state",
+                "message": (
+                    "Not forwarded: credit and quota errors describe the "
+                    "account's plan, not a defect, so the Brandfetch team does "
+                    "not act on them. Tell the user to check their plan and "
+                    f"credits at {DASHBOARD_URL} . If a genuine data or tool "
+                    "problem also occurred, send it separately without the "
+                    "credit part."
+                ),
+            }
+        )
+
     client_id = _client_id_var.get("")
     org_urn = _org_urn_var.get("")
     stage = os.environ.get("STAGE", "local")
@@ -1280,6 +1473,32 @@ async def send_feedback(
     )
 
 
+@mcp.resource(
+    BRAND_CARD_URI,
+    name="Brand card UI",
+    description=(
+        "Interactive brand profile card rendered in place of get_brand "
+        "results by MCP Apps hosts: logo preview with download and copy-URL "
+        "actions, plus tabs for colors, fonts, images, company "
+        "firmographics, and on-demand brand context."
+    ),
+    app=AppConfig(
+        csp=ResourceCSP(
+            # Download button fetches asset bytes from the CDN (connect-src);
+            # the logo preview <img> loads from it too (img-src).
+            connect_domains=["https://cdn.brandfetch.io"],
+            resource_domains=["https://cdn.brandfetch.io"],
+        ),
+        permissions=ResourcePermissions(clipboard_write={}),
+        prefers_border=True,
+    ),
+)
+def brand_card_ui() -> str:
+    """Serve the built single-file brand-card app (mimeType auto-resolves to
+    text/html;profile=mcp-app for ui:// URIs)."""
+    return _BRAND_CARD_PATH.read_text(encoding="utf-8")
+
+
 async def health(request: Request):
     return JSONResponse({"status": "ok"})
 
@@ -1318,10 +1537,13 @@ app = mcp.http_app(
 )
 app.add_middleware(CredentialsMiddleware)
 app.add_middleware(NonEmptyBodyMiddleware)
+if os.environ.get("MCP_DEBUG_RPC"):
+    app.add_middleware(RpcMethodLogMiddleware)
 app.routes.append(Route("/health", health))
 app.routes.append(Route(OPENAI_APPS_CHALLENGE_PATH, openai_apps_challenge))
-app.routes.append(Route(OAUTH_PROTECTED_RESOURCE_PATH, oauth_protected_resource))
-app.routes.append(Route(f"{OAUTH_PROTECTED_RESOURCE_PATH}/mcp", oauth_protected_resource_mcp))
+if OAUTH_DISCOVERY_ENABLED:
+    app.routes.append(Route(OAUTH_PROTECTED_RESOURCE_PATH, oauth_protected_resource))
+    app.routes.append(Route(f"{OAUTH_PROTECTED_RESOURCE_PATH}/mcp", oauth_protected_resource_mcp))
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

@@ -1,0 +1,1082 @@
+<!doctype html>
+<!-- Built from services/mcp-server/ui/ — do not edit the copy in src/ui/. Rebuild with: cd services/mcp-server/ui && npm run build -->
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Brandfetch Brand Card</title>
+    <style>
+      /* Styling follows Anthropic's MCP Apps design guidelines: all chrome —
+         backgrounds, text, borders, radii, type — comes from the host style
+         tokens so the card adapts to Claude's theme automatically.
+
+         The tokens are aliased once here with fallbacks, rather than inlined at
+         every use site, so the card still renders correctly in a host that
+         injects no tokens (Claude Desktop, local dev). The fallbacks are the
+         only place any literal colour appears. */
+      :root {
+        --bg: var(--color-background-primary, #ffffff);
+        --bg-soft: var(--color-background-secondary, #f5f4ed);
+        --fg: var(--color-text-primary, #141413);
+        --fg-secondary: var(--color-text-secondary, #3d3d3a);
+        --fg-muted: var(--color-text-tertiary, #73726c);
+        --border: var(--color-border-tertiary, rgba(31, 30, 29, 0.15));
+        --border-strong: var(--color-border-primary, rgba(31, 30, 29, 0.4));
+        --inverse-bg: var(--color-background-inverse, #141413);
+        --inverse-fg: var(--color-text-inverse, #ffffff);
+        --danger: var(--color-text-danger, #7f2c28);
+
+        --fallback-bg-success: #e9f1dc;
+        --fallback-fg-success: #265b19;
+        --fallback-bg-warning: #f6eedf;
+        --fallback-fg-warning: #5a4815;
+
+        --stroke: var(--border-width-regular, 0.5px);
+        --r-sm: var(--border-radius-sm, 6px);
+        --r-md: var(--border-radius-md, 8px);
+        --r-lg: var(--border-radius-lg, 10px);
+        --r-xl: var(--border-radius-xl, 12px);
+        --r-full: var(--border-radius-full, 9999px);
+
+        --size-caption: var(--font-text-xs-size, 12px);
+        --size-body: var(--font-text-sm-size, 14px);
+        --size-heading: var(--font-heading-lg-size, 20px);
+        --lh-body: var(--font-text-sm-line-height, 1.4);
+        --lh-heading: var(--font-heading-lg-line-height, 1.25);
+        --weight-regular: var(--font-weight-normal, 400);
+        --weight-emphasis: var(--font-weight-semibold, 600);
+
+        /* Brandfetch blue: brand identity, allowed by the guidelines for
+           accents. Used only on the active tab underline, the primary action,
+           the claimed check and the selected-asset ring. Both tints clear
+           WCAG AA against the host background in their own theme. */
+        --accent: #0b6bfb;
+        --accent-fg: #ffffff;
+
+        /* Asset backdrops are content, not chrome, and are the INVERSE of the
+           artwork: `theme: light` means light artwork, which needs the dark
+           tile. Deliberately never follows Claude's theme — a white logo needs
+           a dark backdrop even in light mode (PRD-5043). */
+        /* Greyish, not pure white/black: mislabelled artwork (theme says dark
+           but the ink is light, or vice versa) stays faintly visible instead
+           of vanishing — same resilience trick as the brandfetch.com playground. */
+        --tile-light: #f2f2f0;
+        --tile-dark: #1f1f1e;
+        --tile-dark-fg: #9c9a92;
+
+        color-scheme: light dark;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: var(--color-background-primary, #30302e);
+          --bg-soft: var(--color-background-secondary, #262624);
+          --fg: var(--color-text-primary, #faf9f5);
+          --fg-secondary: var(--color-text-secondary, #c2c0b6);
+          --fg-muted: var(--color-text-tertiary, #9c9a92);
+          --border: var(--color-border-tertiary, rgba(222, 220, 209, 0.15));
+          --border-strong: var(--color-border-primary, rgba(222, 220, 209, 0.4));
+          --inverse-bg: var(--color-background-inverse, #faf9f5);
+          --inverse-fg: var(--color-text-inverse, #141413);
+          --danger: var(--color-text-danger, #ee8884);
+          --fallback-bg-success: #1b4614;
+          --fallback-fg-success: #7ab948;
+          --fallback-bg-warning: #483a0f;
+          --fallback-fg-warning: #d1a041;
+          --accent: #4d8dff;
+          --accent-fg: #08101f;
+        }
+      }
+      :root[data-theme='dark'] {
+        --accent: #4d8dff;
+        --accent-fg: #08101f;
+      }
+      :root[data-theme='light'] {
+        --accent: #0b6bfb;
+        --accent-fg: #ffffff;
+      }
+      * {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+      }
+      body {
+        /* The host's typeface token; the fallback stack is the one the MCP
+           Apps SDK examples prescribe, never a font we picked. */
+        font-family: var(--font-sans, system-ui, sans-serif);
+        background: var(--bg);
+        color: var(--fg);
+        font-size: var(--size-body);
+        font-weight: var(--weight-regular);
+        line-height: var(--lh-body);
+      }
+      .card {
+        padding: 6px 20px 20px;
+        display: flex;
+        flex-direction: column;
+        gap: 16px;
+      }
+      /* Header: logo tile | name+domain | CTA, meta line underneath. */
+      .header {
+        display: grid;
+        grid-template-columns: auto 1fr auto;
+        gap: 8px 14px;
+        align-items: center;
+      }
+      .brand-tile {
+        width: 56px;
+        height: 56px;
+        background: var(--tile-light);
+        border: var(--stroke) solid var(--border);
+        border-radius: var(--r-xl);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        overflow: hidden;
+      }
+      .brand-tile img {
+        max-width: 72%;
+        max-height: 72%;
+        object-fit: contain;
+      }
+      .name-row {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+      .brand-name {
+        font-size: var(--size-heading);
+        line-height: var(--lh-heading);
+        font-weight: var(--weight-emphasis);
+      }
+      .header-main {
+        min-width: 0;
+      }
+      .name-row {
+        position: relative;
+      }
+      /* Claim state is a seal icon: blue when claimed, muted when unclaimed;
+         the unclaimed seal deep-links into the register flow. */
+      .claim-seal {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        /* 44px hit area around an 18px glyph; negative margins keep the
+           visual footprint compact. */
+        flex: 0 0 44px;
+        width: 44px;
+        min-width: 44px;
+        height: 44px;
+        margin: -13px -10px;
+        padding: 0;
+        background: none;
+        border: none;
+        color: var(--fg-muted);
+        cursor: pointer;
+      }
+      .claim-seal.claimed {
+        color: var(--accent);
+        cursor: default;
+      }
+      /* Search-result rows keep the text badge. */
+      .badge {
+        font-size: var(--size-caption);
+        font-weight: var(--weight-emphasis);
+        color: var(--accent);
+        background: var(--bg-soft);
+        border: var(--stroke) solid var(--border);
+        border-radius: var(--r-full);
+        padding: 3px 10px;
+        white-space: nowrap;
+      }
+      .tooltip {
+        position: absolute;
+        top: calc(100% + 6px);
+        left: 0;
+        z-index: 30;
+        max-width: 280px;
+        background: var(--inverse-bg);
+        color: var(--inverse-fg);
+        font-size: var(--size-caption);
+        font-weight: var(--weight-regular);
+        line-height: var(--lh-body);
+        border-radius: var(--r-sm);
+        padding: 6px 10px;
+      }
+      .brand-domain {
+        color: var(--fg-muted);
+      }
+      .header-cta {
+        align-self: center;
+      }
+      /* In-widget brand search (PRD-5045 5.2): a picker, not a browser. */
+      .search {
+        position: relative;
+      }
+      .search-icon {
+        position: absolute;
+        left: 16px;
+        top: 50%;
+        transform: translateY(-50%);
+        display: inline-flex;
+        color: var(--fg-muted);
+        pointer-events: none;
+      }
+      .search-clear {
+        position: absolute;
+        right: 4px;
+        top: 50%;
+        transform: translateY(-50%);
+        width: 44px;
+        height: 44px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        padding: 0;
+        background: none;
+        border: none;
+        color: var(--fg-muted);
+        cursor: pointer;
+      }
+      .search-clear:hover {
+        color: var(--fg);
+      }
+      .search input {
+        font: inherit;
+        width: 100%;
+        min-height: 44px;
+        padding: 10px 48px 10px 44px;
+        color: var(--fg);
+        background: var(--bg);
+        border: 1px solid var(--border);
+        border-radius: var(--r-full);
+        outline: none;
+      }
+      .search input:focus {
+        border-color: var(--border-strong);
+      }
+      .search input::placeholder {
+        color: var(--fg-muted);
+      }
+      .search-results {
+        position: absolute;
+        top: calc(100% + 4px);
+        left: 0;
+        right: 0;
+        z-index: 40;
+        background: var(--bg);
+        border: var(--stroke) solid var(--border-strong);
+        border-radius: var(--r-md);
+        overflow: hidden;
+      }
+      .search-result {
+        font: inherit;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        width: 100%;
+        min-height: 44px;
+        padding: 8px 12px;
+        background: none;
+        border: none;
+        color: var(--fg);
+        cursor: pointer;
+        text-align: left;
+      }
+      .search-result:hover,
+      .search-result:focus {
+        background: var(--bg-soft);
+      }
+      .search-result img {
+        width: 24px;
+        height: 24px;
+        border-radius: var(--r-sm);
+        flex: 0 0 auto;
+      }
+      .search-result .sr-domain {
+        color: var(--fg-muted);
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .search-result .badge {
+        margin-left: auto;
+      }
+      .search-note {
+        display: flex;
+        align-items: center;
+        min-height: 44px;
+        padding: 8px 12px;
+        color: var(--fg-muted);
+      }
+      .btn {
+        font: inherit;
+        font-weight: var(--weight-emphasis);
+        min-height: 44px;
+        padding: 10px 18px;
+        border-radius: var(--r-md);
+        border: var(--stroke) solid var(--border-strong);
+        background: var(--bg);
+        color: var(--fg);
+        cursor: pointer;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+      }
+      .btn.small {
+        padding: 8px 14px;
+      }
+      .btn.primary {
+        background: var(--accent);
+        border-color: var(--accent);
+        color: var(--accent-fg);
+      }
+      .btn.contrast {
+        background: var(--bg-soft);
+        border-color: var(--border);
+        color: var(--fg);
+      }
+      .btn.text {
+        background: none;
+        border-color: transparent;
+        padding: 10px 4px;
+      }
+      /* The header CTA keeps a light outline at rest; hover strengthens it. */
+      #view-bf-btn {
+        border-color: var(--border);
+        padding: 10px 14px;
+      }
+      #view-bf-btn:hover {
+        border-color: var(--border-strong);
+      }
+      .btn:hover {
+        border-color: var(--fg-muted);
+      }
+      .btn.primary:hover,
+      .btn.contrast:hover {
+        border-color: var(--border-strong);
+      }
+      .btn:disabled {
+        opacity: 0.5;
+        cursor: default;
+      }
+      .btn-icon {
+        display: inline-flex;
+      }
+      .tabs {
+        display: flex;
+        gap: 24px;
+        flex-wrap: wrap;
+      }
+      .tab {
+        font: inherit;
+        font-weight: var(--weight-emphasis);
+        min-height: 44px;
+        padding: 8px 2px;
+        background: none;
+        border: none;
+        border-bottom: 2px solid transparent;
+        margin-bottom: -1px;
+        color: var(--fg-muted);
+        cursor: pointer;
+      }
+      .tab:hover {
+        color: var(--fg-secondary);
+      }
+      .tab[aria-selected='true'] {
+        color: var(--fg);
+        border-bottom-color: var(--accent);
+      }
+      .tab-count {
+        color: var(--fg-muted);
+        margin-left: 8px;
+        display: none;
+      }
+      .tab[aria-selected='true'] .tab-count {
+        display: inline;
+      }
+      /* All tabs share one height (the tallest); shorter tabs top-align. */
+      .panels {
+        position: relative;
+      }
+      .panel {
+        display: flex;
+        flex-direction: column;
+        gap: 14px;
+      }
+      /* Gallery (logos + images tabs): preview grows to match the grid. */
+      .g-layout {
+        display: flex;
+        gap: 16px;
+        align-items: stretch;
+        flex-wrap: wrap;
+      }
+      .preview {
+        flex: 1 1 326px;
+        min-width: 0;
+        border: 1px solid var(--border);
+        border-radius: var(--r-xl);
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+        background: var(--bg);
+      }
+      .preview-canvas {
+        flex: 1 1 auto;
+        min-height: 180px;
+        position: relative;
+        background: var(--tile-light);
+        padding: 20px;
+      }
+      /* Absolutely positioned so the artwork's natural size can never drive
+         the row height — switching logos must not resize the preview
+         — switching logos must not resize the card. The row is sized by the grid (or the
+         180px floor); the image just fits inside it. */
+      .preview img {
+        position: absolute;
+        inset: 0;
+        margin: auto;
+        max-width: 80%;
+        max-height: 80%;
+        object-fit: contain;
+      }
+      .preview.image .preview-canvas img {
+        max-width: 100%;
+        max-height: 100%;
+        border-radius: var(--r-xs, 4px);
+      }
+      .preview.fixed .preview-canvas {
+        flex: 0 0 180px;
+        min-height: 180px;
+      }
+      .preview-caption {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 10px 14px;
+        border-top: 1px solid var(--border);
+      }
+      .preview-label {
+        font-size: var(--size-caption);
+        font-weight: var(--weight-emphasis);
+        color: var(--fg-muted);
+        text-transform: capitalize;
+      }
+      /* Light-ink artwork (theme: "light") needs a dark tile to be visible. */
+      .preview.on-dark .preview-canvas,
+      .thumb.on-dark,
+      .brand-tile.on-dark {
+        background: var(--tile-dark);
+      }
+      .preview-meta {
+        font-size: var(--size-caption);
+        color: var(--fg-muted);
+        text-align: right;
+      }
+      /* One continuous grid: assets flow in sorted order and wrap when a row
+         fills — no forced break between asset types (PRD-5043). */
+      /* Columns auto-fill the available width so tiles stay readable —
+         a fixed column count reads too dense on most brands. */
+      .g-thumbs {
+        flex: 0 0 auto;
+        width: clamp(60px, 38%, 340px);
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(60px, 1fr));
+        gap: 8px;
+        align-content: start;
+      }
+      .thumb {
+        aspect-ratio: 1;
+        min-width: 44px;
+        min-height: 44px;
+        padding: 0;
+        background: var(--tile-light);
+        border: 1px solid var(--border);
+        border-radius: var(--r-lg);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        overflow: hidden;
+        cursor: pointer;
+      }
+      .thumb img {
+        max-width: 70%;
+        max-height: 70%;
+        object-fit: contain;
+        pointer-events: none;
+      }
+      /* Icon-type artwork ships its own baked background: run it edge to
+         edge and let the radius clip it. */
+      .thumb.fill img,
+      .brand-tile.fill img {
+        width: 100%;
+        height: 100%;
+        max-width: none;
+        max-height: none;
+        object-fit: cover;
+      }
+      .thumb[aria-pressed='true'] {
+        border-color: var(--accent);
+        outline: 1px solid var(--accent);
+      }
+      /* Narrow containers (mobile reflow): the thumbnail grid moves under the
+         preview and spans the full width instead of squeezing to two columns. */
+      body.narrow .g-layout {
+        flex-direction: column;
+      }
+      body.narrow .g-thumbs {
+        width: 100%;
+      }
+      body.narrow .g-actions {
+        margin-left: 0;
+      }
+      .asset-footer {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        margin-top: 12px;
+        flex-wrap: wrap;
+      }
+      .avail-label {
+        font-weight: var(--weight-regular);
+        color: var(--fg-muted);
+      }
+      .seg {
+        display: inline-flex;
+        background: var(--bg-soft);
+        border: var(--stroke) solid var(--border);
+        border-radius: var(--r-full);
+        padding: 3px;
+      }
+      .seg button {
+        font: inherit;
+        font-size: 11px;
+        font-weight: var(--weight-emphasis);
+        text-transform: uppercase;
+        position: relative;
+        min-height: 30px;
+        padding: 4px 12px;
+        border: var(--stroke) solid transparent;
+        border-radius: var(--r-full);
+        background: none;
+        color: var(--fg-muted);
+        cursor: pointer;
+      }
+      /* Compact control, full-size touch target. */
+      .seg button::before {
+        content: '';
+        position: absolute;
+        inset: -7px 0;
+      }
+      .seg button[aria-pressed='true'] {
+        background: var(--bg);
+        border-color: var(--border);
+        color: var(--fg);
+      }
+      .g-actions {
+        margin-left: auto;
+        display: flex;
+        gap: 10px;
+        flex-wrap: wrap;
+      }
+      /* Section titles read as plain bold labels. */
+      .section-label {
+        font-weight: var(--weight-emphasis);
+        color: var(--fg);
+        margin-top: 8px;
+      }
+      .muted {
+        color: var(--fg-muted);
+      }
+      .chips {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+      .chip {
+        font: inherit;
+        font-size: var(--size-caption);
+        font-weight: var(--weight-emphasis);
+        min-height: 44px;
+        padding: 6px 14px;
+        display: inline-flex;
+        align-items: center;
+        border-radius: var(--r-md);
+        border: var(--stroke) solid var(--border-strong);
+        background: var(--bg);
+        color: var(--fg);
+        cursor: pointer;
+      }
+      .chip.static {
+        cursor: default;
+        min-height: 0;
+        border-color: transparent;
+        border-radius: var(--r-full);
+      }
+      /* Voice chips: attributes on the success tint, avoid on the warning
+         tint. */
+      .chip.good {
+        background: var(--color-background-success, var(--fallback-bg-success));
+        color: var(--color-text-success, var(--fallback-fg-success));
+      }
+      .chip.avoid {
+        background: var(--color-background-warning, var(--fallback-bg-warning));
+        color: var(--color-text-warning, var(--fallback-fg-warning));
+      }
+      .voice-summary.clamped {
+        display: -webkit-box;
+        -webkit-line-clamp: 5;
+        -webkit-box-orient: vertical;
+        overflow: hidden;
+      }
+      .read-more {
+        font: inherit;
+        font-weight: var(--weight-emphasis);
+        color: var(--accent);
+        background: none;
+        border: none;
+        padding: 0;
+        min-height: 44px;
+        display: flex;
+        align-items: center;
+        cursor: pointer;
+      }
+      /* Colors — swatch fills are brand content, left exactly as the API returns. */
+      .color-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+        gap: 16px;
+      }
+      .color-card {
+        font: inherit;
+        display: flex;
+        flex-direction: column;
+        align-items: stretch;
+        background: none;
+        border: none;
+        color: var(--fg);
+        cursor: pointer;
+        text-align: left;
+        padding: 0;
+      }
+      .color-swatch {
+        height: 68px;
+        border-radius: var(--r-lg);
+        border: var(--stroke) solid var(--border);
+      }
+      .color-role {
+        font-weight: var(--weight-emphasis);
+        margin-top: 8px;
+        text-transform: capitalize;
+      }
+      .color-hex {
+        color: var(--fg-muted);
+      }
+      /* Fonts */
+      .font-row {
+        font: inherit;
+        display: flex;
+        align-items: center;
+        gap: 16px;
+        min-height: 44px;
+        padding: 26px 0 26px 8px;
+        background: none;
+        border: none;
+        border-bottom: var(--stroke) solid var(--border);
+        color: var(--fg);
+        cursor: pointer;
+        text-align: left;
+        width: 100%;
+      }
+      .font-sample {
+        width: 56px;
+        height: 56px;
+        font-size: var(--size-heading);
+        flex: 0 0 auto;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: var(--bg-soft);
+        color: var(--fg-secondary);
+        border: var(--stroke) solid var(--border);
+        border-radius: var(--r-md);
+        font-weight: var(--weight-emphasis);
+      }
+      .font-name {
+        font-weight: var(--weight-emphasis);
+      }
+      .font-detail {
+        font-size: var(--size-caption);
+        color: var(--fg-muted);
+      }
+      /* About: one composed section — text left, company context right
+         (PRD-5045 5.1). Columns stack on narrow widths. */
+      .about-cols {
+        display: flex;
+        gap: 40px;
+        align-items: flex-start;
+      }
+      .about-left {
+        flex: 1 1 0;
+        min-width: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+      }
+      .about-left p + p {
+        margin-top: 8px;
+      }
+      .about-facts {
+        flex: 1 1 0;
+        min-width: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 18px;
+      }
+      body.narrow .about-cols {
+        flex-direction: column;
+      }
+      body.narrow .about-facts {
+        width: 100%;
+      }
+      .social-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+      }
+      .social-link {
+        width: 44px;
+        height: 44px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        color: var(--fg-secondary);
+        background: var(--bg-soft);
+        border: none;
+        border-radius: var(--r-full);
+        cursor: pointer;
+      }
+      .social-link:hover {
+        background: var(--bg-soft);
+        color: var(--fg);
+      }
+      /* Developer footer strip: one quiet row of chrome — mark + attribution
+         left, slogan centred, CTA right. */
+      .dev-footer {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin: 4px -20px -20px;
+        padding: 6px 20px;
+        border-top: var(--stroke) solid var(--border);
+        background: var(--bg-soft);
+        font-size: var(--size-caption);
+      }
+      .dev-home {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        min-height: 44px;
+        padding: 0;
+        background: none;
+        border: none;
+        cursor: pointer;
+      }
+      /* Brandfetch purple gradient on the attribution. */
+      .dev-mark {
+        display: inline-flex;
+        color: #8a63f6;
+        flex: 0 0 auto;
+      }
+      .dev-line1 {
+        font-weight: var(--weight-emphasis);
+        background: linear-gradient(90deg, #8a63f6 0%, #5c7cfa 100%);
+        -webkit-background-clip: text;
+        background-clip: text;
+        color: transparent;
+        white-space: nowrap;
+      }
+      .dev-line2 {
+        flex: 1 1 auto;
+        text-align: left;
+        margin-left: 16px;
+        color: var(--fg-muted);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .dev-cta {
+        margin-left: auto;
+        font: inherit;
+        font-size: var(--size-caption);
+        font-weight: var(--weight-emphasis);
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        min-height: 44px;
+        padding: 0 4px;
+        background: none;
+        border: none;
+        color: var(--fg-muted);
+        cursor: pointer;
+        white-space: nowrap;
+      }
+      body.narrow .dev-line2 {
+        display: none;
+      }
+      /* Narrow viewports: the header CTA keeps only its glyph so it can't
+         collide with the brand name. */
+      body.narrow #view-bf-btn .btn-label {
+        display: none;
+      }
+      /* Google-hosted fonts link out to their specimen page. */
+      .font-link {
+        margin-left: auto;
+        display: inline-flex;
+        align-items: center;
+        min-height: 44px;
+        padding: 0 10px;
+        font-size: var(--size-caption);
+        font-weight: var(--weight-emphasis);
+        color: var(--accent);
+        cursor: pointer;
+        white-space: nowrap;
+      }
+      /* The "+N more" tile that reveals the rest of an oversized asset grid. */
+      .thumb.view-more {
+        font-size: var(--size-caption);
+        font-weight: var(--weight-emphasis);
+        color: var(--fg-secondary);
+        background: var(--bg-soft);
+        text-align: center;
+      }
+      /* Borderless company facts: bold label over plain value. */
+      .fact-label {
+        font-weight: var(--weight-emphasis);
+        color: var(--fg);
+      }
+      .fact-value {
+        color: var(--fg-secondary);
+        margin-top: 4px;
+      }
+      .about-left .long-desc {
+        margin-top: -8px;
+      }
+      .long-desc summary {
+        cursor: pointer;
+        color: var(--accent);
+        font-weight: var(--weight-emphasis);
+        min-height: 44px;
+        display: flex;
+        align-items: center;
+      }
+      .long-desc p {
+        margin-top: 8px;
+        color: var(--fg-muted);
+      }
+      /* Context */
+      .quote {
+        font-weight: var(--weight-emphasis);
+      }
+      .context-row {
+        padding: 10px;
+        border: var(--stroke) solid var(--border);
+        border-radius: var(--r-lg);
+      }
+      .context-row-title {
+        font-weight: var(--weight-emphasis);
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+      .context-row-tag {
+        font-size: var(--size-caption);
+        font-weight: var(--weight-emphasis);
+        color: var(--fg-muted);
+        border: var(--stroke) solid var(--border);
+        border-radius: var(--r-full);
+        padding: 1px 8px;
+        text-transform: capitalize;
+      }
+      .context-row-body {
+        color: var(--fg-muted);
+        margin-top: 2px;
+      }
+      .skeleton .preview,
+      .skeleton .line {
+        animation: pulse 1.4s ease-in-out infinite;
+      }
+      .line {
+        height: 14px;
+        border-radius: var(--r-sm);
+        background: var(--bg-soft);
+      }
+      @keyframes pulse {
+        0%,
+        100% {
+          opacity: 1;
+        }
+        50% {
+          opacity: 0.55;
+        }
+      }
+      .error {
+        color: var(--danger);
+        padding: 20px;
+      }
+      .hidden {
+        display: none !important;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="skeleton" class="card skeleton">
+      <div class="header">
+        <div class="brand-tile"></div>
+        <div>
+          <div class="line" style="width: 140px; height: 22px"></div>
+          <div class="line" style="width: 100px; margin-top: 8px"></div>
+        </div>
+        <div></div>
+      </div>
+      <div class="g-layout">
+        <div class="preview"></div>
+      </div>
+    </div>
+
+    <div id="card" class="card hidden">
+      <div class="search hidden" id="search">
+        <span class="search-icon" aria-hidden="true">
+          <svg
+            viewBox="0 0 24 24"
+            width="18"
+            height="18"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          >
+            <circle cx="11" cy="11" r="8" />
+            <path d="m21 21-4.35-4.35" />
+          </svg>
+        </span>
+        <input
+          id="search-input"
+          type="text"
+          placeholder="Type a brand name or URL to search"
+          autocomplete="off"
+          spellcheck="false"
+          aria-label="Search brands"
+        />
+        <button id="search-clear" class="search-clear" aria-label="Clear search">
+          <svg
+            viewBox="0 0 24 24"
+            width="16"
+            height="16"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            aria-hidden="true"
+          >
+            <path d="M18 6 6 18M6 6l12 12" />
+          </svg>
+        </button>
+        <div id="search-results" class="search-results hidden" role="listbox"></div>
+      </div>
+      <div class="header">
+        <div class="brand-tile" id="brand-tile"><img id="brand-logo" alt="" /></div>
+        <div class="header-main">
+          <div class="name-row">
+            <span class="brand-name" id="brand-name"></span>
+            <button id="claim-badge" class="claim-seal hidden" aria-describedby="badge-tip">
+              <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+                <path
+                  fill="currentColor"
+                  d="M12 1.2 14.5 3l3-.4 1.2 2.8 2.8 1.2-.4 3 1.9 2.4-1.9 2.4.4 3-2.8 1.2-1.2 2.8-3-.4-2.5 1.8L9.5 21l-3 .4-1.2-2.8-2.8-1.2.4-3L1 12l1.9-2.4-.4-3 2.8-1.2L6.5 2.6l3 .4z"
+                />
+                <path fill="var(--bg)" d="m10.6 14.7-2.5-2.5-1.3 1.3 3.8 3.8 6.6-6.6-1.3-1.3z" />
+              </svg>
+            </button>
+            <span id="badge-tip" class="tooltip hidden" role="tooltip"></span>
+          </div>
+          <div class="brand-domain" id="brand-domain"></div>
+        </div>
+        <div class="header-cta">
+          <button id="view-bf-btn" class="btn text" aria-label="View on Brandfetch">
+            <span class="btn-label">View on Brandfetch</span>
+            <span class="btn-icon">
+              <svg
+                viewBox="0 0 24 24"
+                width="15"
+                height="15"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                aria-hidden="true"
+              >
+                <path
+                  d="M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"
+                />
+              </svg>
+            </span>
+          </button>
+        </div>
+      </div>
+
+      <div class="tabs hidden" id="tabs" role="tablist"></div>
+
+      <div class="panels" id="panels">
+        <div id="panel-logos" class="panel hidden"></div>
+        <div id="panel-colors" class="panel hidden">
+          <div class="color-grid" id="color-grid"></div>
+        </div>
+        <div id="panel-fonts" class="panel hidden">
+          <div id="font-list"></div>
+        </div>
+        <div id="panel-images" class="panel hidden"></div>
+        <div id="panel-about" class="panel hidden"></div>
+        <div id="panel-context" class="panel hidden"></div>
+      </div>
+
+      <div class="dev-footer">
+        <button id="dev-home" class="dev-home" aria-label="Open brandfetch.com">
+          <span class="dev-mark" aria-hidden="true">
+            <svg viewBox="0 0 29 31" width="13" height="14" fill="none" aria-hidden="true">
+              <path
+                fill="currentColor"
+                d="M29 7.54605C29 9.47222 28.316 11.1378 26.9481 12.5428C25.5802 13.9251 23.5852 14.9222 20.9634 15.534C22.377 15.9192 23.4484 16.5537 24.1781 17.4375C24.9077 18.2987 25.2724 19.2956 25.2724 20.4287C25.2724 22.2189 24.7025 23.7713 23.5625 25.0855C22.4454 26.3998 20.8039 27.4195 18.638 28.1447C16.4721 28.8472 13.8616 29.1985 10.8066 29.1985C9.66666 29.1985 8.75472 29.1645 8.07075 29.0965C8.04796 29.7309 7.77438 30.2068 7.25 30.5241C6.72562 30.8414 6.05307 31 5.23231 31C4.41156 31 3.84159 30.8187 3.52241 30.4561C3.22603 30.0936 3.10062 29.561 3.14623 28.8586C3.35141 25.686 3.75039 22.3662 4.34316 18.8991C4.93593 15.4094 5.68829 12.0442 6.60024 8.80373C6.75982 8.23721 7.07901 7.84064 7.55778 7.61404C8.03656 7.38743 8.66353 7.27412 9.43868 7.27412C10.8294 7.27412 11.5248 7.65936 11.5248 8.42983C11.5248 8.74708 11.4564 9.10965 11.3196 9.51754C10.7268 11.2851 10.134 13.6871 9.54127 16.7237C8.9485 19.7375 8.52674 22.6156 8.27594 25.3575C9.37028 25.448 10.2594 25.4934 10.9434 25.4934C14.1352 25.4934 16.4721 25.0401 17.954 24.1338C19.4587 23.2046 20.2111 22.0263 20.2111 20.5987C20.2111 19.6016 19.778 18.7632 18.9116 18.0833C18.0681 17.4035 16.6431 17.0296 14.6368 16.9616C14.1808 16.939 13.8616 16.8257 13.6792 16.6217C13.4968 16.4178 13.4057 16.0892 13.4057 15.636C13.4057 14.9788 13.5425 14.4463 13.816 14.0384C14.0896 13.6305 14.5912 13.4152 15.3208 13.3925C16.9395 13.3472 18.3986 13.1093 19.6981 12.6787C21.0204 12.2482 22.0578 11.6477 22.8101 10.8772C23.5625 10.0841 23.9387 9.1663 23.9387 8.1239C23.9387 6.80958 23.2889 5.77851 21.9894 5.0307C20.6899 4.26024 18.6949 3.875 16.0047 3.875C13.5652 3.875 11.2056 4.19226 8.92571 4.82676C6.64584 5.4386 4.70793 6.2204 3.11203 7.17215C2.38246 7.6027 1.7669 7.81798 1.26533 7.81798C0.854953 7.81798 0.53577 7.68202 0.307783 7.41009C0.102594 7.1155 0 6.75292 0 6.32237C0 5.75585 0.113994 5.26864 0.341981 4.86075C0.592768 4.45285 1.17414 3.98831 2.08608 3.46711C4.00118 2.37939 6.24685 1.52961 8.82311 0.917763C11.3994 0.305921 14.0326 0 16.7229 0C20.8494 0 23.9272 0.691156 25.9564 2.07347C27.9855 3.45577 29 5.27998 29 7.54605Z"
+              />
+            </svg>
+          </span>
+          <span class="dev-line1">Powered by Brandfetch</span>
+        </button>
+        <span class="dev-line2">The brand layer for modern products and AI agents</span>
+        <button id="dev-cta" class="dev-cta">
+          Try our APIs
+          <svg
+            viewBox="0 0 24 24"
+            width="12"
+            height="12"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
+          >
+            <path d="M7 17 17 7M8 7h9v9" />
+          </svg>
+        </button>
+      </div>
+    </div>
+
+    <div id="error" class="error hidden"></div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

@@ -9,6 +9,8 @@ def test_app_loads():
     assert app is not None
     # Server instructions steer clients to direct CDN fetch when egress allows
     assert "*.brandfetch.io" in (mcp.instructions or "")
+    # ...and route visual/asset intents to the interactive card (PRD-5044)
+    assert "interactive brand card" in (mcp.instructions or "")
     # ...and toward proactive feedback (PRD-4952)
     assert "send_feedback" in (mcp.instructions or "")
 
@@ -20,6 +22,61 @@ def test_asset_resource_template_registered():
     templates = asyncio.run(mcp.list_resource_templates())
     uris = {t.uri_template for t in templates}
     assert "bf://asset/{domain}/{type}" in uris
+
+
+def test_brand_card_ui_resource_registered():
+    """The MCP Apps brand-card resource is exposed with the ui profile and CSP."""
+    from src.main import BRAND_CARD_URI, mcp
+
+    resources = asyncio.run(mcp.list_resources())
+    card = next(r for r in resources if str(r.uri) == BRAND_CARD_URI)
+
+    assert card.mime_type == "text/html;profile=mcp-app"
+    ui = (card.meta or {})["ui"]
+    assert ui["csp"]["connectDomains"] == ["https://cdn.brandfetch.io"]
+    assert ui["csp"]["resourceDomains"] == ["https://cdn.brandfetch.io"]
+    assert "clipboardWrite" in ui["permissions"]
+
+
+def test_get_brand_declares_brand_card_app():
+    """get_brand carries _meta.ui.resourceUri so Apps hosts render the card."""
+    from src.main import BRAND_CARD_URI, mcp
+
+    tools = asyncio.run(mcp.list_tools())
+    get_brand = next(t for t in tools if t.name == "get_brand")
+
+    assert (get_brand.meta or {})["ui"]["resourceUri"] == BRAND_CARD_URI
+    # The optional `view` deep-link opens the card on a specific tab.
+    schema = get_brand.parameters
+    view = schema["properties"]["view"]
+    enum = view.get("enum") or next((o["enum"] for o in view.get("anyOf", []) if "enum" in o), [])
+    assert "brand_voice" in enum
+    assert schema["required"] == ["identifier"]
+
+
+def test_brand_card_resource_serves_built_html():
+    """Guards against a missing/stale ui build artifact under src/ui/."""
+    from src.main import BRAND_CARD_URI, mcp
+
+    result = asyncio.run(mcp.read_resource(BRAND_CARD_URI))
+    html = result.contents[0].content
+    assert "<html" in html
+    # single-file build: no external script/style references
+    assert 'src="http' not in html
+    # full-profile card (PRD-5045): tabbed panels, the constant borderless
+    # CTA with claim state as a seal icon,
+    # in-widget search, and the developer footer strip.
+    for marker in (
+        "panel-colors",
+        "panel-about",
+        "panel-context",
+        "View on Brandfetch",
+        "claim-badge",
+        "search-input",
+        "search-clear",
+        "Powered by Brandfetch",
+    ):
+        assert marker in html
 
 
 def test_resolve_asset_src_picks_matching_type():
