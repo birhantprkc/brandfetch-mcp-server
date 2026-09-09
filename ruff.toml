@@ -1,0 +1,4 @@
+# Formatting config mirrored from the monorepo root (Brandfetch-API/ruff.toml):
+# 100 columns, ruff pinned so a release cannot change what CI enforces.
+line-length = 100
+required-version = "==0.15.11"
