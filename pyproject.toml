@@ -1,11 +1,13 @@
 [project]
 name = "brandfetch-mcp-server"
-version = "1.4.0"
+version = "1.5.0"
 description = "Brandfetch MCP Server - Brand data for AI assistants"
 requires-python = ">=3.11,<3.12"
 dependencies = [
     "boto3>=1.34.0",
-    "fastmcp>=2.0.0",
+    # 3.2.0 is the first release carrying both `fastmcp.apps` and the middleware `on_initialize`
+    # hook; an older resolution fails on import, before the server starts.
+    "fastmcp>=3.2.0",
     "httpx>=0.27.0",
     "uvicorn>=0.30.0",
 ]

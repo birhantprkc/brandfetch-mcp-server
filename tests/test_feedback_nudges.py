@@ -39,7 +39,7 @@ def test_credit_errors_are_named_account_state_not_defects(status):
 
 def test_credit_tools_docstrings_disclaim_account_state():
     tools = {t.name: t for t in asyncio.run(main.mcp.list_tools())}
-    for name in ("get_brand", "get_brand_context", "enrich_transaction"):
+    for name in ("get_brand", "get_brand_data", "get_brand_context", "enrich_transaction"):
         description = tools[name].description or ""
         assert "never report it with send_feedback" in description, name
     assert "Do not report credit or quota errors" in (main.mcp.instructions or "")
@@ -70,5 +70,5 @@ def test_instructions_and_data_quality_tools_mention_send_feedback():
     assert "send_feedback" in (main.mcp.instructions or "")
 
     tools = {t.name: t for t in asyncio.run(main.mcp.list_tools())}
-    for name in ("get_brand", "get_brand_context"):
+    for name in ("get_brand", "get_brand_data", "get_brand_context"):
         assert "send_feedback" in (tools[name].description or ""), name

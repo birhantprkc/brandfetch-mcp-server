@@ -10,14 +10,15 @@ the Brandfetch API.
 
 ## Tools
 
-| Tool                 | Description                                                                     |
-| -------------------- | ------------------------------------------------------------------------------- |
-| `brand_search`       | Search for brands by name using Brandfetch's search index.                      |
-| `get_brand`          | Look up full brand data by domain, stock ticker, ISIN, or crypto symbol.        |
-| `enrich_transaction` | Identify a merchant brand from a credit-card or bank-statement string.          |
-| `get_brand_context`  | Get LLM-ready brand context for a domain — voice, audience, positioning, style. |
-| `build_logo_urls`    | Construct Brandfetch Logo CDN URLs for one or more brands (no API call).        |
-| `send_feedback`      | Report bugs, wrong or stale brand data, or missing capabilities to Brandfetch.  |
+| Tool                 | Description                                                                                                                     |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `brand_search`       | Search for brands by name using Brandfetch's search index.                                                                      |
+| `get_brand`          | Look up full brand data by domain, email, ticker, ISIN, or crypto symbol; renders the interactive brand card on MCP Apps hosts. |
+| `get_brand_data`     | The same brand data with no card — for logo walls, multi-brand work, and data that feeds generated content.                     |
+| `enrich_transaction` | Identify a merchant brand from a credit-card or bank-statement string.                                                          |
+| `get_brand_context`  | Get LLM-ready brand context for a domain — voice, audience, positioning, style.                                                 |
+| `build_logo_urls`    | Construct Brandfetch Logo CDN URLs for one or more brands (no API call).                                                        |
+| `send_feedback`      | Report bugs, wrong or stale brand data, or missing capabilities to Brandfetch.                                                  |
 
 ## Interactive brand card (MCP Apps)
 
@@ -25,8 +26,11 @@ On hosts that support the [MCP Apps extension](https://modelcontextprotocol.io/d
 (claude.ai, Claude Desktop, ...), `get_brand` results render as an interactive
 brand card: logo preview, format switcher (SVG/PNG/WebP/...), download and
 copy-URL actions. Hosts without Apps support fall back to the regular JSON tool
-result. The widget source lives in [`ui/`](./ui/) and is served by the server as
-the `ui://brandfetch/brand-card.html` resource.
+result. `get_brand_data` returns the same brand data without the card, so a
+logo wall of six brands is six data calls rather than six cards; the model picks
+between the two by their descriptions. The widget source lives in
+[`ui/`](./ui/) and is served by the server as the
+`ui://brandfetch/brand-card.html` resource.
 
 ## Quick start (hosted server)
 
@@ -80,7 +84,7 @@ with no token and complete the authorization flow in the browser.
 
 ## Quota errors
 
-`get_brand`, `enrich_transaction`, and `get_brand_context` consume API credits
+`get_brand`, `get_brand_data`, `enrich_transaction`, and `get_brand_context` consume API credits
 from your plan; `brand_search` and `build_logo_urls` don't and keep working
 when your credits run out.
 

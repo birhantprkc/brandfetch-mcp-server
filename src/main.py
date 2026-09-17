@@ -4,6 +4,7 @@ import json
 import os
 import re
 from pathlib import Path
+from collections.abc import Awaitable, Callable
 from typing import Annotated, Literal
 
 from pydantic import Field
@@ -12,9 +13,10 @@ from urllib.parse import parse_qsl, unquote, urlparse
 from fastmcp import FastMCP
 from fastmcp.apps import AppConfig, ResourceCSP, ResourcePermissions
 from fastmcp.resources import ResourceContent, ResourceResult
+from fastmcp.server.middleware import Middleware, MiddlewareContext
 from fastmcp.tools.tool import ToolResult
 import httpx
-from mcp.types import ResourceLink, TextContent
+from mcp.types import InitializeRequest, InitializeResult, ResourceLink, TextContent
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
@@ -56,9 +58,17 @@ mcp = FastMCP(
         "download link they can use directly, call get_brand and let the "
         "card do the presenting \u2014 it beats describing assets in text or "
         "pasting raw URLs.\n\n"
+        "One brand vs many: get_brand is for showing ONE brand the user "
+        "wants to look at. When several brands are involved, or the data "
+        "is an input to something you are about to produce (a logo wall, "
+        "a comparison table, a slide, generated content or code, "
+        "background on what a company does), call get_brand_data instead "
+        "— same data, no card. A logo wall of six brands is six "
+        "get_brand_data calls, not six cards.\n\n"
         "Asset bytes: when a task needs actual image bytes — embedding a "
         "logo or icon into PPTX, DOCX, PDF, HTML, or any generated file — "
-        "fetch the credentialed asset 'src' URLs from get_brand directly "
+        "fetch the credentialed asset 'src' URLs from get_brand or "
+        "get_brand_data directly "
         "(curl, requests, fetch) from your execution environment. That is "
         "the only fast, reliable path, and it keeps image bytes out of the "
         "conversation.\n\n"
@@ -310,6 +320,36 @@ def _publish_event(event_name: str, payload: dict) -> None:
             **({"clientId": client_id} if client_id else {}),
         },
     )
+
+
+class ClientConnectionMiddleware(Middleware):
+    """Publish `mcp.client.connected` for each session's initialize handshake.
+
+    Every MCP client opens a session with `initialize` before it can call
+    anything, and that request is the only place the client identifies itself
+    (`clientInfo`). It is the closest thing the protocol has to "someone
+    installed us": a claude.ai connector reaches it seconds after the OAuth
+    grant, an editor as soon as the config is saved.
+    """
+
+    async def on_initialize(
+        self,
+        context: MiddlewareContext[InitializeRequest],
+        call_next: Callable[[MiddlewareContext[InitializeRequest]], Awaitable[InitializeResult]],
+    ) -> InitializeResult:
+        result = await call_next(context)
+        client = getattr(context.message.params, "clientInfo", None)
+        _publish_event(
+            "mcp.client.connected",
+            {
+                "client": {
+                    "name": getattr(client, "name", "") or "",
+                    "version": getattr(client, "version", "") or "",
+                },
+                "protocolVersion": getattr(context.message.params, "protocolVersion", "") or "",
+            },
+        )
+        return result
 
 
 FEEDBACK_NUDGE = (
@@ -676,13 +716,15 @@ async def brand_search(query: str) -> str:
     Returns a ranked list of matches. Each match contains:
     - `brandId` (str): Brandfetch's internal ID.
     - `domain` (str): The brand's primary domain. Pass this to `get_brand`
-      to fetch full details.
+      (one brand, interactive card) or `get_brand_data` (several brands,
+      or data for a task) to fetch full details.
     - `name` (str): Display name.
     - `icon` (str): CDN URL to a small representation of the brand, suitable
       for autocomplete-style UIs. Display-only: embed it as returned (e.g. in
       an `<img>` tag) — it is not programmatically fetchable, and must not be
       edited. For other asset types, sizes, or downloadable bytes, call
-      `get_brand`; for display-only variants, `build_logo_urls`.
+      `get_brand` or `get_brand_data`; for display-only variants,
+      `build_logo_urls`.
     - `claimed` (bool): Whether the brand has officially claimed their listing.
       Claimed brands generally have higher-quality, brand-approved assets.
     - `verified` (bool): Whether Brandfetch has verified the listing.
@@ -696,6 +738,9 @@ async def brand_search(query: str) -> str:
     When the user's goal is to see the brand or grab its assets, follow up
     with get_brand on the chosen domain — on MCP Apps hosts it renders an
     interactive card with logo preview, download, and copy-URL actions.
+    When several results feed one deliverable (a logo wall, a table, a
+    slide), follow up with get_brand_data per brand instead — same data,
+    no card.
 
     Args:
         query: Brand name query string (e.g. "Madame Kim", "Nike").
@@ -721,136 +766,188 @@ async def brand_search(query: str) -> str:
     return resp.text
 
 
-@mcp.tool(
-    annotations={
-        "title": "Get Brand Details",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": True,
-    },
-    app=AppConfig(resource_uri=BRAND_CARD_URI),
+BRAND_FETCHED_EVENT = "mcp.brand.fetched"
+# Published next to BRAND_FETCHED_EVENT by the card-bearing tool only, so the share of
+# brand fetches that went through the interactive card can be read off the event bus.
+BRAND_CARD_SERVED_EVENT = "mcp.brand-card.served"
+
+_BRAND_IDENTIFIER_DOC = (
+    'A domain ("nike.com"), an email address at one ("owner@acme.example" '
+    'resolves to the brand behind acme.example), a ticker ("NKE"), an ISIN '
+    '("US6541061031"), or a crypto symbol ("BTC").'
 )
-async def get_brand(
-    identifier: str,
-    view: Annotated[
-        Literal["about", "logos", "colors", "fonts", "images", "brand_voice"] | None,
-        Field(
-            description=(
-                "The aspect of the brand the user asked about — ALWAYS set "
-                "this when they name one, so the interactive card opens on "
-                "the right tab: colors ('their colors', 'brand palette') → "
-                "'colors'; fonts/typography → 'fonts'; logo/icon → 'logos'; "
-                "banners/imagery → 'images'; company info/description → "
-                "'about'; brand voice/tone/personality → 'brand_voice'. "
-                "Omit only for general brand lookups. Never changes the "
-                "returned data."
-            ),
-        ),
-    ] = None,
-) -> ToolResult:
-    """Look up full brand data by domain, email address, stock ticker, ISIN, or crypto symbol.
 
-    On MCP Apps hosts (claude.ai, Claude Desktop) this tool also renders an
-    interactive brand profile card in the conversation: live logo preview
-    with variant/format switchers and one-click Download / Copy URL, plus
-    tabs for brand colors, fonts, images, company firmographics, and
-    on-demand brand context (voice, positioning, products). Prefer it over
-    text answers or build_logo_urls whenever the user's intent is visual or
-    asset-oriented:
-    - see or visualize a brand ("show me Nike's logo", "what does their
-      branding look like"),
-    - download a logo file, or get a URL / embed link they can use directly,
-    - compare variants (logo vs symbol vs icon, light vs dark) or formats
-      (SVG, PNG, WebP) and pick one.
-    When the user names a specific aspect (colors, fonts, brand voice,
-    imagery, company info), also set `view` so the card opens on that tab.
-    Once the card is rendered, don't re-list asset URLs in text — the card's
-    Download and Copy URL buttons already hand the user the exact file and a
-    ready-to-use URL.
+# Description blocks shared verbatim by get_brand and get_brand_data: the two tools
+# return the same response, so everything about the lookup, the payload, the URL
+# rules and the errors is written once. Only the steering paragraphs differ.
+_BRAND_LOOKUP_DOC = """\
+Call this directly when you have a confident identifier — either from a
+prior `brand_search` result, or from your own knowledge for well-known
+brands (e.g. "coca-cola.com" needs no search first). If the identifier is
+uncertain or the brand is obscure, use `brand_search` first to disambiguate.
 
-    Call this directly when you have a confident identifier — either from a
-    prior `brand_search` result, or from your own knowledge for well-known
-    brands (e.g. you can call `get_brand("coca-cola.com")` directly without
-    searching first). If the identifier is uncertain or the brand is obscure,
-    use `brand_search` first to disambiguate.
+The identifier is auto-resolved in this order: domain → ticker → ISIN →
+crypto. Examples (all Nike): "nike.com", "NKE", "US6541061031". For
+crypto: "BTC", "ETH". An identifier that contains "@" is read as an email
+address and resolved to the brand behind its registrable domain: an
+address at nike.com gives Nike. Mailbox-provider domains resolve like any
+other domain. You judge whether the domain is the contact's company — the
+API does not.
 
-    The identifier is auto-resolved in this order: domain → ticker → ISIN →
-    crypto. Examples (all Nike): "nike.com", "NKE", "US6541061031". For
-    crypto: "BTC", "ETH". An identifier that contains "@" is read as an email
-    address and resolved to the brand behind its domain ("john@nike.com" →
-    Nike, "joe@gmail.com" → gmail.com). Mailbox-provider domains resolve like
-    any other domain. You judge whether the domain is the contact's company —
-    the API does not.
+For clean brand name lookups, prefer brand_search followed by this tool —
+those are more reliable for unambiguous queries.
+"""
 
-    For clean brand name lookups, prefer brand_search followed by get_brand —
-    those are more reliable for unambiguous queries.
+_BRAND_RESPONSE_DOC = """\
+Returns a brand object containing:
+- `name`, `domain`, `description`: Core identity.
+- `logos` (list): Typed visual assets. The `type` field distinguishes:
+  * `logo`: The full brand mark, typically a wordmark or wordmark+symbol
+     combination intended for headers, signatures, and contexts with
+     horizontal space (e.g. "Coca-Cola" in script).
+  * `symbol`: The standalone graphical mark without text, used when the
+    brand is already identified by context (e.g. the Nike swoosh alone).
+  * `icon`: A square, compact representation optimized for small sizes —
+    favicons, app icons, avatars, list items. May be the symbol, an
+    initial, or a simplified mark.
+  * `other`: Anything that doesn't fit the above (mascots, seals, etc.).
 
-    Set `view` to the aspect of the brand the user asked about, and the
-    interactive card opens on that tab: "okta brand voice" → "brand_voice",
-    "brandfetch colors" → "colors", "their fonts" → "fonts". Omit it for
-    general lookups. It never changes the returned data, and hosts without
-    the card simply ignore it.
+  Pick by use case, not by name: a "show me the logo" request from a user
+  usually wants `type: "logo"` for display, but `type: "icon"` for a
+  small UI element like a list row or chat avatar.
+- `colors` (list): Brand colors as `{hex, type, brightness}` where `type`
+  is `primary` | `accent` | `dark` | `light` | `brand`.
+- `fonts` (list): `{name, type, origin, originId}`.
+- `links` (list): Social and web links as `{name, url}`.
+- `company`: Metadata including `industries`, `employees`, `foundedYear`,
+  `location`, and `kind` (public | private | etc.).
+"""
 
-    Returns a brand object containing:
-    - `name`, `domain`, `description`: Core identity.
-    - `logos` (list): Typed visual assets. The `type` field distinguishes:
-      * `logo`: The full brand mark, typically a wordmark or wordmark+symbol
-         combination intended for headers, signatures, and contexts with
-         horizontal space (e.g. "Coca-Cola" in script).
-      * `symbol`: The standalone graphical mark without text, used when the
-        brand is already identified by context (e.g. the Nike swoosh alone).
-      * `icon`: A square, compact representation optimized for small sizes —
-        favicons, app icons, avatars, list items. May be the symbol, an
-        initial, or a simplified mark.
-      * `other`: Anything that doesn't fit the above (mascots, seals, etc.).
+_BRAND_URL_RULES_DOC = """\
+**IMPORTANT — use all URLs exactly as returned:**
+Every URL in the response (logo `src` fields, image URLs, etc.) must be
+used verbatim. Do not modify, rewrite, or substitute any part of them —
+including the `?c=` query parameter. That token is a per-request
+credential issued by the API specifically for this response; replacing it
+with any other client ID (including one from context or memory) will break
+the URL.
 
-      Pick by use case, not by name: a "show me the logo" request from a user
-      usually wants `type: "logo"` for display, but `type: "icon"` for a
-      small UI element like a list row or chat avatar.
-    - `colors` (list): Brand colors as `{hex, type, brightness}` where `type`
-      is `primary` | `accent` | `dark` | `light` | `brand`.
-    - `fonts` (list): `{name, type, origin, originId}`.
-    - `links` (list): Social and web links as `{name, url}`.
-    - `company`: Metadata including `industries`, `employees`, `foundedYear`,
-      `location`, and `kind` (public | private | etc.).
+To download asset bytes, fetch the `src` URL directly (curl/requests)
+whenever your environment can reach cdn.brandfetch.io — that keeps the
+bytes out of the conversation. On claude.ai a blocked fetch means
+`*.brandfetch.io` is missing from the code-execution network allowlist
+(Settings > Capabilities): tell the user to add it — or, on
+Team/Enterprise plans, to ask an Owner/Admin — before generating
+anything that embeds brand images; the experience is much better with
+it. Clients that support MCP resource reads can otherwise use the
+`resource_link` blocks this tool returns (`bf://asset/{domain}/{type}`).
+"""
 
-    **IMPORTANT — use all URLs exactly as returned:**
-    Every URL in the response (logo `src` fields, image URLs, etc.) must be
-    used verbatim. Do not modify, rewrite, or substitute any part of them —
-    including the `?c=` query parameter. That token is a per-request
-    credential issued by the API specifically for this response; replacing it
-    with any other client ID (including one from context or memory) will break
-    the URL.
+_BRAND_ERRORS_DOC = """\
+Errors:
+- 403 / "explicit deny": The brand exists in the index but the plan
+  behind the API key has no API credits, or the key lacks access. Do not
+  retry — fall back to displaying the `icon` URL from `brand_search`
+  (display-only, not downloadable) and tell the user to check their
+  plan. Account state, not a bug: never report it with send_feedback.
+- 404: Identifier not found. Try `brand_search` with a name query instead.
+- 429: API quota exhausted for the billing period. Do not retry —
+  `brand_search` and `build_logo_urls` do not consume quota and keep
+  working. Account state, not a bug: never report it with send_feedback.
 
-    To download asset bytes, fetch the `src` URL directly (curl/requests)
-    whenever your environment can reach cdn.brandfetch.io — that keeps the
-    bytes out of the conversation. On claude.ai a blocked fetch means
-    `*.brandfetch.io` is missing from the code-execution network allowlist
-    (Settings > Capabilities): tell the user to add it — or, on
-    Team/Enterprise plans, to ask an Owner/Admin — before generating
-    anything that embeds brand images; the experience is much better with
-    it. Clients that support MCP resource reads can otherwise use the
-    `resource_link` blocks this tool returns (`bf://asset/{domain}/{type}`).
+If the returned data is visibly wrong or stale (wrong logo, outdated
+colors, missing company info), report it with send_feedback (category
+"data-quality"), including the brand's domain.
+"""
 
-    Errors:
-    - 403 / "explicit deny": The brand exists in the index but the plan
-      behind the API key has no API credits, or the key lacks access. Do not
-      retry — fall back to displaying the `icon` URL from `brand_search`
-      (display-only, not downloadable) and tell the user to check their
-      plan. Account state, not a bug: never report it with send_feedback.
-    - 404: Identifier not found. Try `brand_search` with a name query instead.
-    - 429: API quota exhausted for the billing period. Do not retry —
-      `brand_search` and `build_logo_urls` do not consume quota and keep
-      working. Account state, not a bug: never report it with send_feedback.
+_GET_BRAND_DESCRIPTION = (
+    """\
+Show a brand to the user. Looks up full brand data by domain, email
+address, stock ticker, ISIN, or crypto symbol and, on MCP Apps hosts
+(claude.ai, Claude Desktop), renders it as an interactive brand profile
+card in the conversation: live logo preview with variant/format switchers
+and one-click Download / Copy URL, plus tabs for colors, fonts, images,
+company facts and brand voice.
 
-    If the returned data is visibly wrong or stale (wrong logo, outdated
-    colors, missing company info), report it with send_feedback (category
-    "data-quality"), including the brand's domain.
+Use this when the user wants to SEE, view, explore or pick from ONE brand
+inside the conversation:
+- "show me Nike's logo", "what does their branding look like", "Okta's
+  brand voice",
+- download a logo file, or copy a URL / embed link they can use directly,
+- compare variants (logo vs symbol vs icon, light vs dark) or formats
+  (SVG, PNG, WebP) and pick one.
+When the user names an aspect (colors, fonts, imagery, company info,
+brand voice), set `view` so the card opens on that tab. Once the card is
+rendered, don't re-list asset URLs in text — its Download and Copy URL
+buttons already hand the user the exact file and a ready-to-use URL.
 
-    Args:
-        identifier: A domain ("nike.com"), email address ("john@nike.com"),
-            ticker ("NKE"), ISIN ("US6541061031"), or crypto symbol ("BTC").
+Use `get_brand_data` instead — same lookup, same response, no card — when
+the brand data is an INPUT to something you are producing rather than the
+thing the user wants to look at: several brands assembled into a logo
+wall, table, slide or comparison; content, code or documents generated
+from the data; or background on what a company does. Never call this
+tool once per brand for a multi-brand request: each call renders its own
+card.
+
+"""
+    + _BRAND_LOOKUP_DOC
+    + """
+Set `view` to the aspect of the brand the user asked about, and the
+interactive card opens on that tab: "okta brand voice" → "brand_voice",
+"brandfetch colors" → "colors", "their fonts" → "fonts". Omit it for
+general lookups. It never changes the returned data, and hosts without
+the card simply ignore it.
+
+"""
+    + _BRAND_RESPONSE_DOC
+    + "\n"
+    + _BRAND_URL_RULES_DOC
+    + "\n"
+    + _BRAND_ERRORS_DOC
+)
+
+_GET_BRAND_DATA_DESCRIPTION = (
+    """\
+Fetch a brand's data by domain, email address, stock ticker, ISIN, or
+crypto symbol — as data, with no interactive card. Same lookup, same
+response and same credentialed asset URLs as `get_brand`.
+
+Use this when the data FEEDS A TASK rather than a display:
+- several brands — logo walls, comparison tables, customer or partner
+  slides, lists of companies: call it once per brand (calls can run in
+  parallel) and assemble the result yourself,
+- generating content or code from brand data — HTML/CSS using the brand
+  colors, a deck or document embedding the logo, design tokens, on-brand
+  copy,
+- programmatic processing — fetching asset bytes from the `src` URLs,
+  extracting a palette, reading a company's industry, size or founding
+  year,
+- context for yourself — understanding what a company does before
+  answering; pair with `get_brand_context` for voice, audience and
+  positioning.
+
+If the user's goal is to SEE one brand — its logo, colors or profile in
+the conversation — or to download or copy an asset themselves, call
+`get_brand` instead: on claude.ai and Claude Desktop it renders an
+interactive card with preview, download and copy-URL actions, which beats
+pasting URLs into text.
+
+"""
+    + _BRAND_LOOKUP_DOC
+    + "\n"
+    + _BRAND_RESPONSE_DOC
+    + "\n"
+    + _BRAND_URL_RULES_DOC
+    + "\n"
+    + _BRAND_ERRORS_DOC
+)
+
+
+async def _fetch_brand(identifier: str, *, card: bool = False) -> ToolResult:
+    """The brand lookup behind get_brand and get_brand_data.
+
+    `card` marks the call as coming from the card-bearing tool, which publishes
+    BRAND_CARD_SERVED_EVENT next to the BRAND_FETCHED_EVENT both tools emit.
     """
     api_key = _get_api_key()
     async with httpx.AsyncClient(timeout=BRAND_API_TIMEOUT_SECONDS) as client:
@@ -858,14 +955,14 @@ async def get_brand(
             f"{BRANDFETCH_API_BASE}/brands/{identifier}",
             headers={"Authorization": f"Bearer {api_key}"},
         )
-    _publish_event(
-        "mcp.brand.fetched",
-        {
-            "identifier": _domain_only(identifier),
-            "success": resp.is_success,
-            "statusCode": resp.status_code,
-        },
-    )
+    payload = {
+        "identifier": _domain_only(identifier),
+        "success": resp.is_success,
+        "statusCode": resp.status_code,
+    }
+    _publish_event(BRAND_FETCHED_EVENT, payload)
+    if card:
+        _publish_event(BRAND_CARD_SERVED_EVENT, payload)
     if not resp.is_success:
         raise ValueError(
             _error_message(
@@ -883,6 +980,56 @@ async def get_brand(
     except (json.JSONDecodeError, ValueError):
         links = []
     return ToolResult(content=[TextContent(type="text", text=resp.text), *links])
+
+
+@mcp.tool(
+    description=_GET_BRAND_DESCRIPTION,
+    annotations={
+        "title": "Get Brand Details",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+    app=AppConfig(resource_uri=BRAND_CARD_URI),
+)
+async def get_brand(
+    identifier: Annotated[str, Field(description=_BRAND_IDENTIFIER_DOC)],
+    view: Annotated[
+        Literal["about", "logos", "colors", "fonts", "images", "brand_voice"] | None,
+        Field(
+            description=(
+                "The aspect of the brand the user asked about — ALWAYS set "
+                "this when they name one, so the interactive card opens on "
+                "the right tab: colors ('their colors', 'brand palette') → "
+                "'colors'; fonts/typography → 'fonts'; logo/icon → 'logos'; "
+                "banners/imagery → 'images'; company info/description → "
+                "'about'; brand voice/tone/personality → 'brand_voice'. "
+                "Omit only for general brand lookups. Never changes the "
+                "returned data."
+            ),
+        ),
+    ] = None,
+) -> ToolResult:
+    """Brand lookup that renders the interactive card on MCP Apps hosts."""
+    return await _fetch_brand(identifier, card=True)
+
+
+@mcp.tool(
+    description=_GET_BRAND_DATA_DESCRIPTION,
+    annotations={
+        "title": "Get Brand Data",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def get_brand_data(
+    identifier: Annotated[str, Field(description=_BRAND_IDENTIFIER_DOC)],
+) -> ToolResult:
+    """The same brand lookup as get_brand, without the interactive card."""
+    return await _fetch_brand(identifier)
 
 
 @mcp.tool(
@@ -973,11 +1120,13 @@ async def enrich_transaction(transaction_label: str, country_code: str) -> str:
 async def get_brand_context(domain: str) -> str:
     """Get LLM-ready brand context for a known domain — voice, audience, positioning, style.
 
-    This is the *subjective* counterpart to `get_brand`. Use the two together
-    by what kind of data you need:
-    - `get_brand` → objective, structured facts: logos, colors, fonts, links,
-      industry, employee count, founding year. Use when rendering UI, building
-      a profile card, or citing firmographics.
+    This is the *subjective* counterpart to `get_brand` / `get_brand_data`
+    (same data; the first renders an interactive card, the second returns
+    plain data). Use them together by what kind of data you need:
+    - `get_brand` / `get_brand_data` → objective, structured facts: logos,
+      colors, fonts, links, industry, employee count, founding year. Use when
+      rendering UI, building a profile card, or citing firmographics —
+      `get_brand_data` when the facts feed content you are generating.
     - `get_brand_context` (this tool) → probabilistic, interpretive data:
       how the brand sounds, who it talks to, what it values, what it sells,
       how it feels visually. Use when generating content, reasoning about
@@ -1044,10 +1193,9 @@ async def get_brand_context(domain: str) -> str:
     Args:
         domain: The brand's exact domain, lowercase, no scheme or path
             (e.g. "microsoft.com", "digitec.ch", "fleurdepains.ch"), or an
-            email address on the brand's domain ("john@microsoft.com") — the
-            API resolves it to the registrable domain, a mailbox provider's
-            as much as a company's. If you only have a brand name, call
-            `brand_search` first.
+            email address on the brand's domain — the API resolves it to the
+            registrable domain, a mailbox provider's as much as a company's.
+            If you only have a brand name, call `brand_search` first.
     """
     api_key = _get_api_key()
     async with httpx.AsyncClient(timeout=BRAND_API_TIMEOUT_SECONDS) as client:
@@ -1106,15 +1254,15 @@ async def build_logo_urls(
     those URLs cannot be fetched programmatically under any circumstances.
 
     If you need to actually download or process an asset (save to disk, read
-    pixel data, attach to an email, etc.), use `get_brand` instead. The CDN
-    URLs embedded in `get_brand` responses carry per-request credentials that
-    allow programmatic access.
+    pixel data, attach to an email, etc.), use `get_brand_data` (or
+    `get_brand`) instead. The CDN URLs embedded in their responses carry
+    per-request credentials that allow programmatic access.
 
     Use this tool when you want to:
     - Embed brand logos directly in a web page or UI component
     - Provide a displayable image URL to the user
     - Understand the URL grammar to tune dimensions, theme, or asset type
-      for logos already obtained via `get_brand`
+      for logos already obtained via `get_brand` or `get_brand_data`
 
     When the user wants to preview, compare, or download a brand's assets
     themselves, prefer `get_brand` — on MCP Apps hosts it renders an
@@ -1535,6 +1683,7 @@ app = mcp.http_app(
     transport="streamable-http",
     stateless_http=True,
 )
+mcp.add_middleware(ClientConnectionMiddleware())
 app.add_middleware(CredentialsMiddleware)
 app.add_middleware(NonEmptyBodyMiddleware)
 if os.environ.get("MCP_DEBUG_RPC"):

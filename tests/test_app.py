@@ -11,6 +11,8 @@ def test_app_loads():
     assert "*.brandfetch.io" in (mcp.instructions or "")
     # ...and route visual/asset intents to the interactive card (PRD-5044)
     assert "interactive brand card" in (mcp.instructions or "")
+    # ...and multi-brand / data-input intents to the card-free sibling
+    assert "get_brand_data" in (mcp.instructions or "")
     # ...and toward proactive feedback (PRD-4952)
     assert "send_feedback" in (mcp.instructions or "")
 
@@ -52,6 +54,20 @@ def test_get_brand_declares_brand_card_app():
     enum = view.get("enum") or next((o["enum"] for o in view.get("anyOf", []) if "enum" in o), [])
     assert "brand_voice" in enum
     assert schema["required"] == ["identifier"]
+
+
+def test_get_brand_data_declares_no_app_and_no_view():
+    """get_brand_data returns the same brand data with no card: no _meta.ui, no `view`."""
+    from src.main import mcp
+
+    tools = asyncio.run(mcp.list_tools())
+    get_brand_data = next(t for t in tools if t.name == "get_brand_data")
+
+    assert "ui" not in (get_brand_data.meta or {})
+    schema = get_brand_data.parameters
+    assert set(schema["properties"]) == {"identifier"}
+    assert schema["required"] == ["identifier"]
+    assert get_brand_data.annotations.readOnlyHint is True
 
 
 def test_brand_card_resource_serves_built_html():
